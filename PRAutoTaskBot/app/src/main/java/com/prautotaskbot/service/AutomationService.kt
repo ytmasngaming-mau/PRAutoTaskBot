@@ -214,8 +214,8 @@ class AutomationService : AccessibilityService() {
         val ov = overlayRect()
         val lines = all.filter { !ov.contains(it.rect.centerX(), it.rect.centerY()) }
 
-        if (pkg == IG_PACKAGE || pkg == TIKTOK_PACKAGE) {
-            handleSocial(pkg, lines, now)
+        if (pkg == IG_PACKAGE || pkg in TIKTOK_PACKAGES) {
+            handleSocial(pkg!!, lines, now)
             return
         }
         val looksPr = lines.any {
@@ -319,7 +319,7 @@ class AutomationService : AccessibilityService() {
             }
             .filter { it.rect.centerY() < h * 0.35 }
             .maxOfOrNull { it.rect.centerY() } ?: (h * 0.15).toInt()
-        val topLimit = statY + 40
+        val topLimit = statY + 25
 
         val headingY = lines
             .filter { it.norm.contains("disarankan untuk") || it.norm.contains("suggested for") }
@@ -341,7 +341,7 @@ class AutomationService : AccessibilityService() {
         fun pick(pred: (OcrWord) -> Boolean): OcrWord? {
             if (anchorYs.isNotEmpty()) {
                 zoneLines.flatMap { it.words }
-                    .filter { pred(it) && anchorYs.any { y -> abs(y - it.rect.centerY()) < 75 } }
+                    .filter { pred(it) && anchorYs.any { y -> abs(y - it.rect.centerY()) < 85 } }
                     .minByOrNull { it.rect.centerY() }
                     ?.let { return it }
             }
@@ -361,7 +361,12 @@ class AutomationService : AccessibilityService() {
             (tapY < 0 || abs(following.rect.centerY() - tapY) < 160)
 
         val onTarget = headerMatchesTarget(lines, h)
-        val label = if (pkg == TIKTOK_PACKAGE) "TikTok" else "Instagram"
+        val label = if (pkg in TIKTOK_PACKAGES) "TikTok" else "Instagram"
+
+        if (phase != Phase.IN_SOCIAL && phase != Phase.SOCIAL_CLICKED && phase != Phase.RETURNING) {
+            phase = Phase.IN_SOCIAL
+            phaseSince = now
+        }
 
         when (phase) {
             Phase.IN_SOCIAL -> {
@@ -415,7 +420,7 @@ class AutomationService : AccessibilityService() {
         val t = targetUser?.filter { it.isLetterOrDigit() } ?: return true
         if (t.length < 3) return true
         val hdr = lines
-            .filter { it.rect.centerY() in (h * 0.03).toInt()..(h * 0.20).toInt() }
+            .filter { it.rect.centerY() in (h * 0.03).toInt()..(h * 0.22).toInt() }
             .joinToString("") { it.norm }
             .filter { it.isLetterOrDigit() }
         if (hdr.isEmpty()) return true
@@ -743,7 +748,11 @@ class AutomationService : AccessibilityService() {
 
     companion object {
         private const val IG_PACKAGE = "com.instagram.android"
-        private const val TIKTOK_PACKAGE = "com.zhiliaoapp.musically"
+        private val TIKTOK_PACKAGES = setOf(
+            "com.ss.android.ugc.trill",
+            "com.zhiliaoapp.musically",
+            "com.zhiliaoapp.musically.go"
+        )
         private const val MAX_PROFILE_TRIES = 5
         private const val PROFILE_TIMEOUT = 25_000L
         private val FOLLOW_WORDS = setOf("ikuti", "follow")
