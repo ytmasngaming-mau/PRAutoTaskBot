@@ -38,11 +38,11 @@ class AutomationService : AccessibilityService() {
     private enum class PlatformMode { TIKTOK, INSTAGRAM }
 
     private class OcrWord(val raw: String, val rect: Rect) {
-        val norm: String = raw.lowercase().filter { it.isLetterOrDigit() }
+        val norm: String = raw.lowercase().replace(Regex("[^a-z0-9]"), "")
     }
 
     private class OcrLine(val text: String, val rect: Rect, val words: List<OcrWord>) {
-        val norm: String = text.lowercase().split(" ").filter { it.isNotEmpty() }.joinToString(" ")
+        val norm: String = text.lowercase().replace(Regex("\\s+"), " ").trim()
     }
 
     private val job = SupervisorJob()
@@ -73,7 +73,6 @@ class AutomationService : AccessibilityService() {
     private var nextAllowedAt = 0L
     private var doneCount = 0
     private var lastShotError = 0
-
     private var sawLimit50 = false
     private var postLimit50CooldownApplied = false
     private var statusText = "Siap. Tekan tombol untuk mulai."
@@ -127,7 +126,7 @@ class AutomationService : AccessibilityService() {
             setTextColor(Color.WHITE)
             setBackgroundColor(0xCC000000.toInt())
             setPadding(16, 8, 16, 8)
-            maxWidth = 540
+            maxWidth = 520
         }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -165,7 +164,7 @@ class AutomationService : AccessibilityService() {
             nextAllowedAt = 0L
             sawLimit50 = false
             postLimit50CooldownApplied = false
-            setStatus("Bot jalan (Loop: TikTok -> Refresh -> Instagram -> Refresh).")
+            setStatus("Bot jalan. Buka halaman Tugas.")
         } else {
             setStatus("Bot dimatikan.")
         }
@@ -177,7 +176,7 @@ class AutomationService : AccessibilityService() {
             setBackgroundColor(if (enabled) 0xEE2E7D32.toInt() else 0xEEC62828.toInt())
         }
         val modeLabel = if (activeMode == PlatformMode.TIKTOK) "TT" else "IG"
-        statusView?.text = "$statusText\n✔ $doneCount selesai | Mode: $modeLabel"
+        statusView?.text = "$statusText\n✔ $doneCount selesai | $modeLabel"
     }
 
     private fun setStatus(s: String) {
@@ -200,23 +199,6 @@ class AutomationService : AccessibilityService() {
         }
     }
 
-    private fun isSocialScreen(pkg: String?, lines: List<OcrLine>): Boolean {
-        if (pkg == IG_PACKAGE || pkg == TIKTOK_PACKAGE) return true
-        val h = resources.displayMetrics.heightPixels
-        val hasFollowAction = lines.any { line ->
-            val n = line.norm
-            line.rect.centerY() < h * 0.55 &&
-                (n == "ikuti" || n == "follow" || n.startsWith("mengikuti") || n.startsWith("following"))
-        }
-        val hasSocialStats = lines.any { line ->
-            val n = line.norm
-            n.contains("pengikut") || n.contains("mengikuti") || n.contains("followers") ||
-                n.contains("postingan") || (n.contains("suka") && line.rect.centerY() < h * 0.30)
-        }
-        val hasAtHandle = lines.any { it.raw.trim().startsWith("@") && it.rect.centerY() < h * 0.30 }
-        return hasFollowAction && (hasSocialStats || hasAtHandle)
-    }
-
     private suspend fun tick() {
         val now = System.currentTimeMillis()
         val pkg = rootInActiveWindow?.packageName?.toString() ?: currentPkg
@@ -232,19 +214,15 @@ class AutomationService : AccessibilityService() {
         val ov = overlayRect()
         val lines = all.filter { !ov.contains(it.rect.centerX(), it.rect.centerY()) }
 
-        if (isSocialScreen(pkg, lines)) {
-            val detectedPkg = pkg ?: if (activeMode == PlatformMode.TIKTOK) TIKTOK_PACKAGE else IG_PACKAGE
-            handleSocialApp(detectedPkg, lines, now)
+        if (pkg == IG_PACKAGE || pkg == TIKTOK_PACKAGE) {
+            handleSocial(pkg, lines, now)
             return
         }
-
         val looksPr = lines.any {
-            val n = it.norm
-            n.contains("ikuti di instagram") || n.contains("ikuti di tiktok") ||
-                n.contains("periksa follow saya") || n.contains("buka profil dan ikuti") ||
-                n.contains("tugas saya") || n.contains("sedang dikerjakan") ||
-                n.contains("semua platform") || n.contains("bayaran tertinggi") ||
-                n.contains("batas per jam tercapai") || n.contains("jeda untuk menjaga akun")
+            it.norm.contains("ikuti di instagram") || it.norm.contains("ikuti di tiktok") ||
+                it.norm.contains("periksa follow saya") || it.norm.contains("buka profil dan ikuti") ||
+                it.norm.contains("tugas saya") || it.norm.contains("sedang dikerjakan") ||
+                it.norm.contains("batas per jam tercapai") || it.norm.contains("jeda untuk menjaga akun")
         }
         if (looksPr) {
             if (pkg != null) browserPkg = pkg
@@ -317,17 +295,15 @@ class AutomationService : AccessibilityService() {
         return Rect(loc[0], loc[1], loc[0] + o.width, loc[1] + o.height)
     }
 
-    private fun handleSocialApp(pkg: String, lines: List<OcrLine>, now: Long) {
+    private fun handleSocial(pkg: String, lines: List<OcrLine>, now: Long) {
         if (lines.any {
-                val n = it.norm
-                n.contains("coba lagi nanti") || n.contains("try again later") ||
-                    n.contains("tindakan diblokir") || n.contains("action blocked") ||
-                    n.contains("terlalu sering") || n.contains("too many requests")
+                it.norm.contains("coba lagi nanti") || it.norm.contains("try again later") ||
+                    it.norm.contains("tindakan diblokir") || it.norm.contains("action blocked")
             }
         ) {
             enabled = false
-            setStatus("⛔ Akun dibatasi platform. Bot dimatikan, istirahat dulu.")
-            Toast.makeText(this, "Akun dibatasi platform. Bot dimatikan.", Toast.LENGTH_LONG).show()
+            setStatus("⛔ Akun dibatasi. Bot dimatikan, istirahat dulu.")
+            Toast.makeText(this, "Akun dibatasi. Bot dimatikan.", Toast.LENGTH_LONG).show()
             return
         }
 
@@ -339,11 +315,11 @@ class AutomationService : AccessibilityService() {
                 it.norm == "postingan" || it.norm == "posts" ||
                     it.norm == "pengikut" || it.norm == "followers" ||
                     it.norm == "mengikuti" || it.norm == "following" ||
-                    it.norm == "suka" || it.norm == "likes"
+                    it.norm == "suka"
             }
             .filter { it.rect.centerY() < h * 0.35 }
-            .maxOfOrNull { it.rect.centerY() } ?: (h * 0.16).toInt()
-        val topLimit = statY + 25
+            .maxOfOrNull { it.rect.centerY() } ?: (h * 0.15).toInt()
+        val topLimit = statY + 40
 
         val headingY = lines
             .filter { it.norm.contains("disarankan untuk") || it.norm.contains("suggested for") }
@@ -365,7 +341,7 @@ class AutomationService : AccessibilityService() {
         fun pick(pred: (OcrWord) -> Boolean): OcrWord? {
             if (anchorYs.isNotEmpty()) {
                 zoneLines.flatMap { it.words }
-                    .filter { pred(it) && anchorYs.any { y -> abs(y - it.rect.centerY()) < 85 } }
+                    .filter { pred(it) && anchorYs.any { y -> abs(y - it.rect.centerY()) < 75 } }
                     .minByOrNull { it.rect.centerY() }
                     ?.let { return it }
             }
@@ -382,56 +358,51 @@ class AutomationService : AccessibilityService() {
         val following = pick { it.norm.startsWith("mengik") || it.norm in FOLLOWING_WORDS }
         val followBtn = pick { it.norm in FOLLOW_WORDS }
         val followingOk = following != null &&
-            (tapY < 0 || abs(following.rect.centerY() - tapY) < 170)
+            (tapY < 0 || abs(following.rect.centerY() - tapY) < 160)
 
         val onTarget = headerMatchesTarget(lines, h)
-        val platformLabel = if (pkg == TIKTOK_PACKAGE) "TikTok" else "Instagram"
-
-        if (phase != Phase.IN_SOCIAL && phase != Phase.SOCIAL_CLICKED && phase != Phase.RETURNING) {
-            phase = Phase.IN_SOCIAL
-            phaseSince = now
-        }
+        val label = if (pkg == TIKTOK_PACKAGE) "TikTok" else "Instagram"
 
         when (phase) {
             Phase.IN_SOCIAL -> {
                 if (!onTarget) {
                     if (now - phaseSince > PROFILE_TIMEOUT) {
-                        retryProfile(now, "Profil $platformLabel bukan target")
+                        retryProfile(now, "Profil $label bukan target")
                     } else {
-                        setStatus("Menunggu profil @${targetUser ?: "?"} di $platformLabel…")
+                        setStatus("Menunggu profil @${targetUser ?: "?"}…")
                     }
                 } else if (following != null) {
                     verifiedFollow = true
-                    returnToBrowser(now, "Sudah mengikuti di $platformLabel")
+                    returnToBrowser(now, "Sudah mengikuti")
                 } else if (followBtn != null) {
                     tap(followBtn.rect)
                     tapY = followBtn.rect.centerY()
                     phase = Phase.SOCIAL_CLICKED
                     phaseSince = now
                     socialRetries = 0
-                    setStatus("Menekan tombol Ikuti di $platformLabel…")
+                    setStatus("Menekan tombol Ikuti…")
                 } else if (now - phaseSince > PROFILE_TIMEOUT) {
-                    retryProfile(now, "Tombol Ikuti di $platformLabel tidak ketemu")
+                    retryProfile(now, "Tombol Ikuti tidak ketemu")
                 } else {
-                    setStatus("Mencari tombol Ikuti ($platformLabel)… (${socialAttempts + 1}/$MAX_PROFILE_TRIES)")
+                    setStatus("Mencari tombol Ikuti… (${socialAttempts + 1}/$MAX_PROFILE_TRIES)")
                 }
             }
             Phase.SOCIAL_CLICKED -> {
                 if (onTarget && followingOk) {
                     verifiedFollow = true
-                    returnToBrowser(now, "Berhasil mengikuti di $platformLabel")
+                    returnToBrowser(now, "Berhasil mengikuti")
                 } else if (now - phaseSince > 3500) {
                     if (onTarget && followBtn != null && socialRetries < 2) {
                         socialRetries++
                         tap(followBtn.rect)
                         phaseSince = now
                     } else {
-                        retryProfile(now, "Ikuti belum terdeteksi di $platformLabel")
+                        retryProfile(now, "Ikuti belum berhasil")
                     }
                 }
             }
             Phase.RETURNING -> {
-                if (now - phaseSince > 2200) {
+                if (now - phaseSince > 3000) {
                     launchBrowser()
                     phaseSince = now
                 }
@@ -444,7 +415,7 @@ class AutomationService : AccessibilityService() {
         val t = targetUser?.filter { it.isLetterOrDigit() } ?: return true
         if (t.length < 3) return true
         val hdr = lines
-            .filter { it.rect.centerY() in (h * 0.03).toInt()..(h * 0.22).toInt() }
+            .filter { it.rect.centerY() in (h * 0.03).toInt()..(h * 0.20).toInt() }
             .joinToString("") { it.norm }
             .filter { it.isLetterOrDigit() }
         if (hdr.isEmpty()) return true
@@ -458,7 +429,7 @@ class AutomationService : AccessibilityService() {
     private fun parseTarget(lines: List<OcrLine>): String? {
         val badge = lines.firstOrNull { it.norm.contains("sedang dikerjakan") } ?: return null
         val w = lines.flatMap { it.words }.firstOrNull {
-            it.raw.startsWith("@") && abs(it.rect.centerY() - badge.rect.centerY()) < 80
+            it.raw.startsWith("@") && abs(it.rect.centerY() - badge.rect.centerY()) < 75
         } ?: return null
         val name = w.raw.removePrefix("@").lowercase().filter { it.isLetterOrDigit() || it == '.' || it == '_' }
         return name.ifEmpty { null }
@@ -482,68 +453,44 @@ class AutomationService : AccessibilityService() {
         setStatus("$msg. Ulangi buka profil ($socialAttempts/$MAX_PROFILE_TRIES)")
     }
 
-    private fun hasLimit50Warning(lines: List<OcrLine>): Boolean {
+    private fun hasLimit50(lines: List<OcrLine>): Boolean {
         return lines.any {
             val n = it.norm
             n.contains("batas per jam tercapai") ||
                 n.contains("jeda untuk menjaga akun") ||
-                (n.contains("50") && (n.contains("batas") || n.contains("mnt") || n.contains("menit") || n.contains("jeda")))
+                (n.contains("50") && (n.contains("batas") || n.contains("mnt") || n.contains("menit")))
         }
     }
 
     private fun handlePr(lines: List<OcrLine>, now: Long) {
-        val limit50Now = hasLimit50Warning(lines)
-        if (limit50Now) {
+        if (hasLimit50(lines)) {
             sawLimit50 = true
             postLimit50CooldownApplied = false
-            setStatus("⏳ Peringatan batas 50 terdeteksi di web. Menunggu jeda web selesai…")
+            setStatus("Jeda web 50 aktif. Menunggu selesai…")
         } else if (sawLimit50 && !postLimit50CooldownApplied) {
             sawLimit50 = false
             postLimit50CooldownApplied = true
-            val extraMs = Random.nextLong(5 * 60_000L, 10 * 60_000L + 1)
-            nextAllowedAt = maxOf(nextAllowedAt, now + extraMs)
-            val mins = (extraMs + 30_000L) / 60_000L
-            setStatus("⏳ Jeda web 50 selesai. Jeda sistem tambahan ~$mins menit…")
+            val extra = Random.nextLong(5 * 60_000L, 10 * 60_000L + 1)
+            nextAllowedAt = maxOf(nextAllowedAt, now + extra)
+            setStatus("Jeda sistem tambahan ${(extra / 60_000L).coerceAtLeast(1)} mnt…")
             return
         }
 
-        if (now < nextAllowedAt) {
-            val remSec = (nextAllowedAt - now) / 1000
-            val remMin = remSec / 60
-            val remModSec = remSec % 60
-            setStatus("⏸ Jeda aktif: ${remMin}m ${remModSec}d lagi…")
-            return
-        }
-
-        val hasInProgressModal = lines.any { it.norm.contains("sedang dikerjakan") }
-        val check = lines.firstOrNull {
-            it.norm.contains("periksa follow saya") ||
-                (it.norm.contains("periksa") && (it.norm.contains("follow") || it.norm.contains("saya") || it.norm.contains("tugas")))
-        }
-        val submitBtn = lines.firstOrNull {
-            it.norm.contains("dikirim untuk ditinjau") || it.norm.contains("kirim untuk ditinjau")
-        }
-        val reviewed = lines.any { it.norm.contains("ditinjau") || it.norm.contains("disetujui") }
+        val check = lines.firstOrNull { it.norm.contains("periksa follow saya") }
+        val reviewed = lines.any { it.norm.contains("ditinjau") }
         val startBtn = lines.firstOrNull {
             it.norm.startsWith("mulai") && !it.norm.contains("dalam") && it.norm.any { c -> c.isDigit() }
         }
-        val confirmMark = lines.any { it.norm.contains("konfirmasi follow anda") || it.norm.contains("konfirmasi") }
-        val modalOpen = hasInProgressModal || check != null || submitBtn != null || startBtn != null || confirmMark || reviewed
+        val confirmMark = lines.any { it.norm.contains("konfirmasi follow anda") }
+        val modalOpen = check != null || startBtn != null || confirmMark || reviewed
 
-        if (phase == Phase.CHECKING && (!modalOpen || reviewed)) {
+        if (phase == Phase.CHECKING && (check == null || reviewed)) {
             onTaskDone(now)
             return
         }
 
-        if (submitBtn != null) {
-            tap(submitBtn.rect)
-            phase = Phase.CHECKING
-            phaseSince = now
-            setStatus("Mengirim tugas untuk ditinjau…")
-            return
-        }
-
         if (check == null && startBtn != null) {
+            if (!canStartNew(now)) return
             tap(startBtn.rect)
             phase = Phase.LIST
             phaseSince = now
@@ -553,6 +500,7 @@ class AutomationService : AccessibilityService() {
 
         val nextBtn = lines.firstOrNull { it.norm.contains("tugas berikutnya") }
         if (check == null && nextBtn != null) {
+            if (!canStartNew(now)) return
             tap(nextBtn.rect)
             phase = Phase.LIST
             phaseSince = now
@@ -572,12 +520,13 @@ class AutomationService : AccessibilityService() {
         }
 
         if (check == null) {
-            setStatus("Menunggu jendela tugas sedang dikerjakan…")
+            setStatus("Menunggu jendela tugas…")
             return
         }
 
         when (phase) {
             Phase.LIST -> {
+                if (!canStartNew(now)) return
                 targetUser = parseTarget(lines)
                 tapLink(lines)
                 phase = Phase.IN_SOCIAL
@@ -588,7 +537,7 @@ class AutomationService : AccessibilityService() {
                 verifiedFollow = false
                 cancelAfterReturn = false
                 tapY = -1
-                setStatus("Membuka profil target…")
+                setStatus("Membuka profil…")
             }
             Phase.IN_SOCIAL -> {
                 if (now - phaseSince > 8000) {
@@ -609,7 +558,7 @@ class AutomationService : AccessibilityService() {
                     tapLink(lines)
                     phase = Phase.IN_SOCIAL
                     phaseSince = now
-                    setStatus("Membuka ulang profil target…")
+                    setStatus("Membuka ulang profil…")
                 } else {
                     tap(check.rect)
                     phase = Phase.CHECKING
@@ -634,79 +583,78 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun listStep(lines: List<OcrLine>, now: Long) {
+        if (!canStartNew(now)) return
         val h = resources.displayMetrics.heightPixels
 
-        val tiktokRow = lines
+        val ttRow = lines
             .filter {
                 it.norm.contains("ikuti di tiktok") &&
-                    it.rect.centerY() > h * 0.25 && it.rect.centerY() < h * 0.88
+                    it.rect.centerY() > h * 0.22 && it.rect.centerY() < h * 0.85
             }
             .minByOrNull { it.rect.top }
 
         val igRow = lines
             .filter {
                 it.norm.contains("ikuti di instagram") &&
-                    it.rect.centerY() > h * 0.25 && it.rect.centerY() < h * 0.88
+                    it.rect.centerY() > h * 0.22 && it.rect.centerY() < h * 0.85
             }
             .minByOrNull { it.rect.top }
 
-        val ttLogo = findPlatformLogoCard(lines, h, isTikTok = true)
-        val igLogo = findPlatformLogoCard(lines, h, isTikTok = false)
-        val isAllPlatformView = lines.any { it.norm.contains("semua platform") }
-
         if (activeMode == PlatformMode.TIKTOK) {
-            if (tiktokRow != null) {
+            if (ttRow != null) {
                 idleTicks = 0
-                tap(tiktokRow.rect)
+                tap(ttRow.rect)
                 phaseSince = now
-                setStatus("Membuka tugas Ikuti di TikTok…")
+                setStatus("Membuka tugas TikTok…")
                 return
             }
-            if (ttLogo != null && (isAllPlatformView || idleTicks < 2)) {
+            val ttTab = findPlatformLogo(lines, h, isTikTok = true)
+            if (ttTab != null && idleTicks < 2) {
                 idleTicks++
-                tap(ttLogo.rect)
-                setStatus("Menekan logo TikTok…")
+                tap(ttTab.rect)
+                setStatus("Memilih logo TikTok…")
                 return
             }
             idleTicks++
-            setStatus("Misi TikTok habis / belum ada ($idleTicks)")
-            if (idleTicks >= 3 && now - lastRefreshAt > 10_000) {
+            setStatus("Tugas TikTok tidak terlihat (OCR ${lines.size} baris)")
+            if (idleTicks >= 4 && now - lastRefreshAt > 15000) {
                 idleTicks = 0
                 lastRefreshAt = now
                 activeMode = PlatformMode.INSTAGRAM
-                setStatus("Misi TikTok habis, refresh lalu ke Instagram…")
-                refreshBrowserPage()
+                setStatus("Tugas TikTok habis, refresh lalu ke Instagram…")
+                refreshPage()
             }
         } else {
             if (igRow != null) {
                 idleTicks = 0
                 tap(igRow.rect)
                 phaseSince = now
-                setStatus("Membuka tugas Ikuti di Instagram…")
+                setStatus("Membuka tugas Instagram…")
                 return
             }
-            if (igLogo != null && (isAllPlatformView || idleTicks < 2)) {
+            val igTab = findPlatformLogo(lines, h, isTikTok = false)
+            if (igTab != null && idleTicks < 2) {
                 idleTicks++
-                tap(igLogo.rect)
-                setStatus("Menekan logo Instagram…")
+                tap(igTab.rect)
+                setStatus("Memilih logo Instagram…")
                 return
             }
             idleTicks++
-            setStatus("Misi Instagram habis / belum ada ($idleTicks)")
-            if (idleTicks >= 3 && now - lastRefreshAt > 10_000) {
+            setStatus("Tugas Instagram tidak terlihat (OCR ${lines.size} baris)")
+            if (idleTicks >= 4 && now - lastRefreshAt > 15000) {
                 idleTicks = 0
                 lastRefreshAt = now
                 activeMode = PlatformMode.TIKTOK
-                setStatus("Misi Instagram habis, refresh lalu balik ke TikTok…")
-                refreshBrowserPage()
+                setStatus("Tugas Instagram habis, refresh lalu balik ke TikTok…")
+                refreshPage()
             }
         }
     }
 
-    private fun findPlatformLogoCard(lines: List<OcrLine>, h: Int, isTikTok: Boolean): OcrLine? {
-        val topBand = (h * 0.12).toInt()..(h * 0.26).toInt()
-        val candidates = lines.filter { line ->
-            if (line.rect.centerY() !in topBand) return@filter false
+    private fun findPlatformLogo(lines: List<OcrLine>, h: Int, isTikTok: Boolean): OcrLine? {
+        val topBand = (h * 0.13).toInt()..(h * 0.25).toInt()
+        return lines.firstOrNull { line ->
+            if (line.rect.centerY() !in topBand) return@firstOrNull false
             val n = line.norm
             if (isTikTok) {
                 n == "tiktok" || (n.contains("tiktok") && !n.contains("ikuti di tiktok"))
@@ -714,39 +662,35 @@ class AutomationService : AccessibilityService() {
                 n == "instagram" || (n.contains("instagram") && !n.contains("ikuti di instagram"))
             }
         }
-        if (candidates.isNotEmpty()) return candidates.first()
-
-        val numCards = lines.filter { line ->
-            line.rect.centerY() in topBand && line.norm.all { it.isDigit() } && line.norm.isNotEmpty()
-        }.sortedBy { it.rect.left }
-
-        if (numCards.size >= 2) {
-            return if (isTikTok) numCards[1] else numCards[0]
-        }
-        return null
     }
 
     private fun tapLink(lines: List<OcrLine>) {
         val link = lines.firstOrNull {
             it.norm.contains("instagram.com") || it.norm.contains("tiktok.com")
         } ?: lines.firstOrNull {
-            it.norm.contains("buka profil dan ikuti") || it.norm.contains("buka profil")
+            it.norm.contains("buka profil dan ikuti")
         }
         if (link != null) tap(link.rect)
+    }
+
+    private fun canStartNew(now: Long): Boolean {
+        if (now < nextAllowedAt) {
+            setStatus("Jeda ${(nextAllowedAt - now) / 1000} detik…")
+            return false
+        }
+        return true
     }
 
     private fun onTaskDone(now: Long) {
         doneCount++
         resetTask()
-
         if (doneCount % 10 == 0) {
             val breakMs = Random.nextLong(3 * 60_000L, 5 * 60_000L + 1)
             nextAllowedAt = now + breakMs
-            val mins = (breakMs + 30_000L) / 60_000L
-            setStatus("✅ $doneCount misi selesai! Jeda rutin ~$mins menit (3-5 mnt)…")
+            setStatus("✅ $doneCount selesai. Jeda ${(breakMs / 60_000L).coerceAtLeast(1)} mnt…")
         } else {
             nextAllowedAt = now + Random.nextLong(2000, 4000)
-            setStatus("✅ Tugas selesai ($doneCount). Lanjut misi berikutnya…")
+            setStatus("✅ Tugas selesai. Jeda sebelum tugas berikutnya.")
         }
     }
 
@@ -778,7 +722,7 @@ class AutomationService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
-    private fun refreshBrowserPage() {
+    private fun refreshPage() {
         val pkg = browserPkg ?: return
         try {
             val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://pr.social/tasks"))
