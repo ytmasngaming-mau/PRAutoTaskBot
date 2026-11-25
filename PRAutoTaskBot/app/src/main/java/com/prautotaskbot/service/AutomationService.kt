@@ -32,28 +32,17 @@ import kotlin.coroutines.resume
 import kotlin.math.abs
 import kotlin.random.Random
 
-/**
- * Bot otomatis tugas "Ikuti di Instagram" & "Ikuti di TikTok" di PR.SOCIAL.
- * Alur kerja:
- * 1. Prioritas 1: Tugas "sedang dikerjakan" (lanjutkan/kirim/tugas berikutnya).
- * 2. Di halaman Tugas saat mode "Semua": klik logo/kartu TikTok -> kerjakan misi Follow/Ikuti.
- * 3. Jika misi TikTok habis -> refresh web -> klik logo/kartu Instagram -> kerjakan misi Follow/Ikuti.
- * 4. Jika misi Instagram habis -> refresh web -> balik lagi ke logo/kartu TikTok (loop terus).
- * 5. Jeda tiap 10 misi selesai: acak 3-5 menit (180.000 - 300.000 ms).
- * 6. Tanpa limit internal 50/jam; saat muncul peringatan batas 50 di web (atau setelah jeda
- *    web selesai), terapkan jeda tambahan 5-10 menit (300.000 - 600.000 ms) lalu lanjutkan.
- */
 class AutomationService : AccessibilityService() {
 
     private enum class Phase { LIST, IN_SOCIAL, SOCIAL_CLICKED, RETURNING, CHECKING }
     private enum class PlatformMode { TIKTOK, INSTAGRAM }
 
     private class OcrWord(val raw: String, val rect: Rect) {
-        val norm: String = raw.lowercase().replace(Regex("""[^a-z0-9]"""), "")
+        val norm: String = raw.lowercase().filter { it.isLetterOrDigit() }
     }
 
     private class OcrLine(val text: String, val rect: Rect, val words: List<OcrWord>) {
-        val norm: String = text.lowercase().replace(Regex("""\s+"""), " ").trim()
+        val norm: String = text.lowercase().split(" ").filter { it.isNotEmpty() }.joinToString(" ")
     }
 
     private val job = SupervisorJob()
@@ -85,7 +74,6 @@ class AutomationService : AccessibilityService() {
     private var doneCount = 0
     private var lastShotError = 0
 
-    // Pelacakan jeda 50 / cooldown web agar setelah jeda web berakhir diberi jeda tambahan 5-10 mnt
     private var sawLimit50 = false
     private var postLimit50CooldownApplied = false
     private var statusText = "Siap. Tekan tombol untuk mulai."
@@ -126,8 +114,6 @@ class AutomationService : AccessibilityService() {
         }
         overlay = null
     }
-
-    // ---------------------------------------------------------------- UI
 
     private fun showOverlay() {
         val toggle = TextView(this).apply {
@@ -199,8 +185,6 @@ class AutomationService : AccessibilityService() {
         refreshUi()
     }
 
-    // ---------------------------------------------------------------- Loop
-
     private fun startLoop() {
         loopJob?.cancel()
         loopJob = scope.launch {
@@ -270,8 +254,6 @@ class AutomationService : AccessibilityService() {
         }
     }
 
-    // ---------------------------------------------------------------- Screenshot + OCR
-
     private suspend fun captureBitmap(): Bitmap? = suspendCancellableCoroutine { cont ->
         if (Build.VERSION.SDK_INT < 30) {
             lastShotError = -1
@@ -334,8 +316,6 @@ class AutomationService : AccessibilityService() {
         o.getLocationOnScreen(loc)
         return Rect(loc[0], loc[1], loc[0] + o.width, loc[1] + o.height)
     }
-
-    // ---------------------------------------------------------------- TikTok & Instagram
 
     private fun handleSocialApp(pkg: String, lines: List<OcrLine>, now: Long) {
         if (lines.any {
@@ -501,8 +481,6 @@ class AutomationService : AccessibilityService() {
         phaseSince = now
         setStatus("$msg. Ulangi buka profil ($socialAttempts/$MAX_PROFILE_TRIES)")
     }
-
-    // ---------------------------------------------------------------- Halaman tugas PR.SOCIAL
 
     private fun hasLimit50Warning(lines: List<OcrLine>): Boolean {
         return lines.any {
@@ -739,7 +717,7 @@ class AutomationService : AccessibilityService() {
         if (candidates.isNotEmpty()) return candidates.first()
 
         val numCards = lines.filter { line ->
-            line.rect.centerY() in topBand && line.norm.matches(Regex("""\d+"""))
+            line.rect.centerY() in topBand && line.norm.all { it.isDigit() } && line.norm.isNotEmpty()
         }.sortedBy { it.rect.left }
 
         if (numCards.size >= 2) {
@@ -789,8 +767,6 @@ class AutomationService : AccessibilityService() {
         cancelAfterReturn = false
         tapY = -1
     }
-
-    // ---------------------------------------------------------------- Aksi
 
     private fun launchBrowser() {
         val pkg = browserPkg ?: return
