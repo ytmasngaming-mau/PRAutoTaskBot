@@ -33,13 +33,20 @@ import kotlin.math.abs
 import kotlin.random.Random
 
 /**
- * Bot otomatis tugas "Ikuti di Instagram" di PR.SOCIAL.
- * Cara kerja: potret layar -> baca tulisan (OCR, di HP, tanpa internet) -> ketuk posisi tulisan.
- * Tidak bergantung pada browser mana pun.
+ * Bot otomatis tugas "Ikuti di Instagram" & "Ikuti di TikTok" di PR.SOCIAL.
+ * Alur kerja:
+ * 1. Prioritas 1: Tugas "sedang dikerjakan" (lanjutkan/kirim/tugas berikutnya).
+ * 2. Prioritas 2: TikTok (otomatis klik chip/tab TikTok & kerjakan "Ikuti di TikTok").
+ * 3. Prioritas 3: Instagram (klik chip/tab Instagram & kerjakan "Ikuti di Instagram").
+ * 4. Jeda tiap 10 misi selesai: acak 3-5 menit (180.000 - 300.000 ms).
+ * 5. Tanpa limit internal 50/jam; saat muncul peringatan batas 50 di web (atau saat jeda
+ *    web selesai), terapkan jeda tambahan 5-10 menit (300.000 - 600.000 ms) lalu lanjutkan.
+ * 6. Jika misi Follow/Ikuti habis, refresh halaman web lalu pilih tab/misi Instagram.
  */
 class AutomationService : AccessibilityService() {
 
-    private enum class Phase { LIST, IN_INSTAGRAM, IG_CLICKED, RETURNING, CHECKING }
+    private enum class Phase { LIST, IN_SOCIAL, SOCIAL_CLICKED, RETURNING, CHECKING }
+    private enum class PlatformMode { TIKTOK, INSTAGRAM }
 
     private class OcrWord(val raw: String, val rect: Rect) {
         val norm: String = raw.lowercase().replace(Regex("[^a-z0-9]"), "")
@@ -61,12 +68,13 @@ class AutomationService : AccessibilityService() {
 
     private var enabled = false
     private var phase = Phase.LIST
+    private var activeMode = PlatformMode.TIKTOK
     private var phaseSince = 0L
     private var currentPkg: String? = null
     private var browserPkg: String? = null
     private var checkAttempts = 0
-    private var igRetries = 0
-    private var igAttempts = 0
+    private var socialRetries = 0
+    private var socialAttempts = 0
     private var targetUser: String? = null
     private var tapY = -1
     private var verifiedFollow = false
@@ -76,17 +84,10 @@ class AutomationService : AccessibilityService() {
     private var nextAllowedAt = 0L
     private var doneCount = 0
     private var lastShotError = 0
-    private var needIgTab = true
-    private var igTabTaps = 0
-    private var lastTabTapAt = 0L
-    private var resumeTaps = 0
-    private var lastResumeAt = 0L
-    private var linkWaitSince = 0L
-    private var taskRefreshes = 0
-    private var pageLoadUntil = 0L
-    private var stallSince = 0L
-    private var stallMarked = false
-    private val doneTimes = ArrayList<Long>()
+
+    // Pelacakan jeda 50 / cooldown web agar setelah jeda web berakhir diberi jeda tambahan 5-10 mnt
+    private var sawLimit50 = false
+    private var postLimit50CooldownApplied = false
     private var statusText = "Siap. Tekan tombol untuk mulai."
 
     override fun onServiceConnected() {
@@ -140,7 +141,7 @@ class AutomationService : AccessibilityService() {
             setTextColor(Color.WHITE)
             setBackgroundColor(0xCC000000.toInt())
             setPadding(16, 8, 16, 8)
-            maxWidth = 520
+            maxWidth = 540
         }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -176,11 +177,9 @@ class AutomationService : AccessibilityService() {
         if (enabled) {
             resetTask()
             nextAllowedAt = 0L
-            needIgTab = true
-            igTabTaps = 0
-            pageLoadUntil = 0L
-            stallSince = 0L
-            setStatus("Bot jalan. Buka halaman Tugas.")
+            sawLimit50 = false
+            postLimit50CooldownApplied = false
+            setStatus("Bot jalan (Prioritas: Sedang Dikerjakan -> TikTok -> Instagram).")
         } else {
             setStatus("Bot dimatikan.")
         }
@@ -191,7 +190,8 @@ class AutomationService : AccessibilityService() {
             text = if (enabled) "🤖 AUTO: ON" else "🤖 AUTO: OFF"
             setBackgroundColor(if (enabled) 0xEE2E7D32.toInt() else 0xEEC62828.toInt())
         }
-        statusView?.text = "$statusText\n✔ $doneCount selesai | ${recentCount(System.currentTimeMillis())}/$MAX_PER_HOUR per jam"
+        val modeLabel = if (activeMode == PlatformMode.TIKTOK) "TT" else "IG"
+        statusView?.text = "$statusText\n✔ $doneCount selesai | Mode: $modeLabel"
     }
 
     private fun setStatus(s: String) {
@@ -217,23 +217,9 @@ class AutomationService : AccessibilityService() {
     }
 
     private suspend fun tick() {
-        stallMarked = false
-        tickInner()
-        if (!stallMarked) stallSince = 0L
-    }
-
-    private suspend fun tickInner() {
         val now = System.currentTimeMillis()
         val pkg = rootInActiveWindow?.packageName?.toString() ?: currentPkg
         if (pkg == packageName) return
-
-        // Halaman baru di-refresh: tunggu selesai dimuat
-        if (now < pageLoadUntil) {
-            setStatus("Memuat ulang halaman…")
-            return
-        }
-        // Link profil Instagram tidak jalan sekitar 28 detik -> refresh web
-        if (linkWatchdog(now)) return
 
         val bmp = captureBitmap()
         if (bmp == null) {
@@ -245,20 +231,23 @@ class AutomationService : AccessibilityService() {
         val ov = overlayRect()
         val lines = all.filter { !ov.contains(it.rect.centerX(), it.rect.centerY()) }
 
-        if (pkg == IG_PACKAGE) {
-            handleInstagram(lines, now)
+        if (pkg == IG_PACKAGE || pkg == TIKTOK_PACKAGE) {
+            handleSocialApp(pkg, lines, now)
             return
         }
+
         val looksPr = lines.any {
-            it.norm.contains("ikuti di instagram") || it.norm.contains("periksa follow saya") ||
-                it.norm.contains("buka profil dan ikuti") || it.norm.contains("tugas saya")
+            val n = it.norm
+            n.contains("ikuti di instagram") || n.contains("ikuti di tiktok") ||
+                n.contains("periksa follow saya") || n.contains("buka profil dan ikuti") ||
+                n.contains("tugas saya") || n.contains("sedang dikerjakan") ||
+                n.contains("batas per jam tercapai") || n.contains("jeda untuk menjaga akun")
         }
         if (looksPr) {
             if (pkg != null) browserPkg = pkg
             handlePr(lines, now)
         } else {
             setStatus("Halaman Tugas tidak terlihat (OCR ${lines.size} baris)")
-            markStall(now, "Halaman Tugas tidak terlihat")
         }
     }
 
@@ -327,66 +316,65 @@ class AutomationService : AccessibilityService() {
         return Rect(loc[0], loc[1], loc[0] + o.width, loc[1] + o.height)
     }
 
-    // ---------------------------------------------------------------- Instagram
+    // ---------------------------------------------------------------- TikTok & Instagram
 
-    private fun handleInstagram(lines: List<OcrLine>, now: Long) {
+    private fun handleSocialApp(pkg: String, lines: List<OcrLine>, now: Long) {
         if (lines.any {
-                it.norm.contains("coba lagi nanti") || it.norm.contains("try again later") ||
-                    it.norm.contains("tindakan diblokir") || it.norm.contains("action blocked")
+                val n = it.norm
+                n.contains("coba lagi nanti") || n.contains("try again later") ||
+                    n.contains("tindakan diblokir") || n.contains("action blocked") ||
+                    n.contains("terlalu sering") || n.contains("too many requests")
             }
         ) {
             enabled = false
-            setStatus("⛔ Instagram membatasi akun. Bot dimatikan, istirahat dulu.")
-            Toast.makeText(this, "Instagram membatasi aksi. Bot dimatikan.", Toast.LENGTH_LONG).show()
+            setStatus("⛔ Akun dibatasi platform. Bot dimatikan, istirahat dulu.")
+            Toast.makeText(this, "Akun dibatasi platform. Bot dimatikan.", Toast.LENGTH_LONG).show()
             return
         }
 
         val h = resources.displayMetrics.heightPixels
         val allWords = lines.flatMap { it.words }
 
-        // Batas atas: di bawah baris statistik (postingan/pengikut)
+        // Batas atas: di bawah baris statistik (postingan/pengikut/mengikuti)
         val statY = allWords
-            .filter { it.norm == "postingan" || it.norm == "posts" || it.norm == "pengikut" || it.norm == "followers" }
-            .filter { it.rect.centerY() < h * 0.30 }
-            .maxOfOrNull { it.rect.centerY() } ?: (h * 0.15).toInt()
-        val topLimit = statY + 40
+            .filter {
+                it.norm == "postingan" || it.norm == "posts" ||
+                    it.norm == "pengikut" || it.norm == "followers" ||
+                    it.norm == "mengikuti" || it.norm == "following"
+            }
+            .filter { it.rect.centerY() < h * 0.35 }
+            .maxOfOrNull { it.rect.centerY() } ?: (h * 0.16).toInt()
+        val topLimit = statY + 30
 
-        // Batas bawah: sebelum "Disarankan untuk Anda" (di bawahnya ada tombol Ikuti akun lain!)
+        // Batas bawah: sebelum "Disarankan untuk Anda" / "Suggested for you"
         val headingY = lines
             .filter { it.norm.contains("disarankan untuk") || it.norm.contains("suggested for") }
             .minOfOrNull { it.rect.top }
         val bottomLimit = headingY?.minus(10) ?: (h * 0.88).toInt()
 
-        // Semua kata di area profil target (di bawah statistik, di atas "Disarankan")
         val zoneLines = lines.filter { l ->
             l.words.size <= 6 && l.rect.centerY() in topLimit until bottomLimit
         }
 
-        // Baris yang HANYA berisi kata tombol (Ikuti, Kirim Pesan, Berlangganan, Kontak, dst).
-        // Kalimat bio seperti "Ikuti kami di TikTok" tidak lolos.
         val strictLines = zoneLines.filter { l ->
             l.words.all { it.norm in BUTTON_WORDS || it.norm.length <= 2 || it.norm.startsWith("mengik") }
         }
 
-        // Jangkar: tombol milik profil ini selalu satu baris dengan tombol lain seperti Kirim Pesan.
         val anchorYs = zoneLines.flatMap { it.words }
             .filter { it.norm in ANCHOR_WORDS }
             .map { it.rect.centerY() }
 
         fun pick(pred: (OcrWord) -> Boolean): OcrWord? {
-            // 1. satu baris dengan tombol jangkar (paling pasti)
             if (anchorYs.isNotEmpty()) {
                 zoneLines.flatMap { it.words }
-                    .filter { pred(it) && anchorYs.any { y -> abs(y - it.rect.centerY()) < 70 } }
+                    .filter { pred(it) && anchorYs.any { y -> abs(y - it.rect.centerY()) < 75 } }
                     .minByOrNull { it.rect.centerY() }
                     ?.let { return it }
             }
-            // 2. baris yang isinya hanya kata tombol, ambil yang PALING ATAS
             strictLines.flatMap { it.words }
                 .filter { pred(it) }
                 .minByOrNull { it.rect.centerY() }
                 ?.let { return it }
-            // 3. cadangan terakhir: baris sangat pendek, paling atas
             return zoneLines.filter { it.words.size <= 3 }
                 .flatMap { it.words }
                 .filter { pred(it) }
@@ -396,50 +384,51 @@ class AutomationService : AccessibilityService() {
         val following = pick { it.norm.startsWith("mengik") || it.norm in FOLLOWING_WORDS }
         val followBtn = pick { it.norm in FOLLOW_WORDS }
         val followingOk = following != null &&
-            (tapY < 0 || abs(following.rect.centerY() - tapY) < 150)
+            (tapY < 0 || abs(following.rect.centerY() - tapY) < 170)
 
         val onTarget = headerMatchesTarget(lines, h)
+        val platformLabel = if (pkg == TIKTOK_PACKAGE) "TikTok" else "Instagram"
 
         when (phase) {
-            Phase.IN_INSTAGRAM -> {
+            Phase.IN_SOCIAL -> {
                 if (!onTarget) {
                     if (now - phaseSince > PROFILE_TIMEOUT) {
-                        retryProfile(now, "Profil bukan target")
+                        retryProfile(now, "Profil $platformLabel bukan target")
                     } else {
-                        setStatus("Menunggu profil @${targetUser ?: "?"}…")
+                        setStatus("Menunggu profil @${targetUser ?: "?"} di $platformLabel…")
                     }
                 } else if (following != null) {
                     verifiedFollow = true
-                    returnToBrowser(now, "Sudah mengikuti")
+                    returnToBrowser(now, "Sudah mengikuti di $platformLabel")
                 } else if (followBtn != null) {
                     tap(followBtn.rect)
                     tapY = followBtn.rect.centerY()
-                    phase = Phase.IG_CLICKED
+                    phase = Phase.SOCIAL_CLICKED
                     phaseSince = now
-                    igRetries = 0
-                    setStatus("Menekan tombol Ikuti…")
+                    socialRetries = 0
+                    setStatus("Menekan tombol Ikuti di $platformLabel…")
                 } else if (now - phaseSince > PROFILE_TIMEOUT) {
-                    retryProfile(now, "Tombol Ikuti tidak ketemu")
+                    retryProfile(now, "Tombol Ikuti di $platformLabel tidak ketemu")
                 } else {
-                    setStatus("Mencari tombol Ikuti… (percobaan ${igAttempts + 1}/$MAX_PROFILE_TRIES)")
+                    setStatus("Mencari tombol Ikuti ($platformLabel)… (${socialAttempts + 1}/$MAX_PROFILE_TRIES)")
                 }
             }
-            Phase.IG_CLICKED -> {
+            Phase.SOCIAL_CLICKED -> {
                 if (onTarget && followingOk) {
                     verifiedFollow = true
-                    returnToBrowser(now, "Berhasil mengikuti")
+                    returnToBrowser(now, "Berhasil mengikuti di $platformLabel")
                 } else if (now - phaseSince > 3500) {
-                    if (onTarget && followBtn != null && igRetries < 2) {
-                        igRetries++
+                    if (onTarget && followBtn != null && socialRetries < 2) {
+                        socialRetries++
                         tap(followBtn.rect)
                         phaseSince = now
                     } else {
-                        retryProfile(now, "Ikuti belum berhasil")
+                        retryProfile(now, "Ikuti belum terdeteksi di $platformLabel")
                     }
                 }
             }
             Phase.RETURNING -> {
-                if (now - phaseSince > 3000) {
+                if (now - phaseSince > 2500) {
                     launchBrowser()
                     phaseSince = now
                 }
@@ -448,12 +437,11 @@ class AutomationService : AccessibilityService() {
         }
     }
 
-    /** Cocokkan nama akun di judul profil Instagram dengan akun target dari PR.SOCIAL. */
     private fun headerMatchesTarget(lines: List<OcrLine>, h: Int): Boolean {
         val t = targetUser?.filter { it.isLetterOrDigit() } ?: return true
         if (t.length < 3) return true
         val hdr = lines
-            .filter { it.rect.centerY() in (h * 0.04).toInt()..(h * 0.12).toInt() }
+            .filter { it.rect.centerY() in (h * 0.03).toInt()..(h * 0.22).toInt() }
             .joinToString("") { it.norm }
             .filter { it.isLetterOrDigit() }
         if (hdr.isEmpty()) return true
@@ -464,22 +452,11 @@ class AutomationService : AccessibilityService() {
         return n >= minOf(6, t.length)
     }
 
-    /** Ambil @username target dari jendela tugas PR.SOCIAL. */
     private fun parseTarget(lines: List<OcrLine>): String? {
-        // Lencana "Sedang dikerjakan" di jendela tugas (bukan banner "Tugas sedang dikerjakan")
-        val badge = lines.firstOrNull {
-            it.norm.contains("sedang dikerjakan") && !it.norm.contains("tugas sedang")
-        }
-        val words = lines.flatMap { it.words }
-        val w = (if (badge != null) {
-            words.firstOrNull {
-                it.raw.startsWith("@") && abs(it.rect.centerY() - badge.rect.centerY()) < 70
-            }
-        } else null)
-            // cadangan: baris banner "Ikuti di Instagram · @akun · dimulai ..."
-            ?: lines.firstOrNull { it.norm.contains("dimulai") }
-                ?.words?.firstOrNull { it.raw.startsWith("@") }
-            ?: return null
+        val badge = lines.firstOrNull { it.norm.contains("sedang dikerjakan") } ?: return null
+        val w = lines.flatMap { it.words }.firstOrNull {
+            it.raw.startsWith("@") && abs(it.rect.centerY() - badge.rect.centerY()) < 80
+        } ?: return null
         val name = w.raw.removePrefix("@").lowercase().filter { it.isLetterOrDigit() || it == '.' || it == '_' }
         return name.ifEmpty { null }
     }
@@ -491,42 +468,84 @@ class AutomationService : AccessibilityService() {
         setStatus("$msg, kembali ke halaman tugas")
     }
 
-    /** Gagal menemukan/menekan Ikuti: kembali ke web lalu buka profil lagi (bukan menekan Periksa). */
     private fun retryProfile(now: Long, msg: String) {
-        igAttempts++
+        socialAttempts++
         verifiedFollow = false
         tapY = -1
-        cancelAfterReturn = igAttempts >= MAX_PROFILE_TRIES
+        cancelAfterReturn = socialAttempts >= MAX_PROFILE_TRIES
         if (browserPkg != null) launchBrowser() else performGlobalAction(GLOBAL_ACTION_BACK)
         phase = Phase.RETURNING
         phaseSince = now
-        setStatus("$msg. Ulangi buka profil ($igAttempts/$MAX_PROFILE_TRIES)")
+        setStatus("$msg. Ulangi buka profil ($socialAttempts/$MAX_PROFILE_TRIES)")
     }
 
-    // ---------------------------------------------------------------- Halaman tugas
+    // ---------------------------------------------------------------- Halaman tugas PR.SOCIAL
+
+    private fun hasLimit50Warning(lines: List<OcrLine>): Boolean {
+        return lines.any {
+            val n = it.norm
+            n.contains("batas per jam tercapai") ||
+                n.contains("jeda untuk menjaga akun") ||
+                (n.contains("50") && (n.contains("batas") || n.contains("mnt") || n.contains("menit") || n.contains("jeda")))
+        }
+    }
 
     private fun handlePr(lines: List<OcrLine>, now: Long) {
-        val check = lines.firstOrNull { it.norm.contains("periksa follow saya") }
-        val reviewed = lines.any { it.norm.contains("ditinjau") }
+        // Deteksi peringatan batas 50 di web
+        val limit50Now = hasLimit50Warning(lines)
+        if (limit50Now) {
+            sawLimit50 = true
+            postLimit50CooldownApplied = false
+            setStatus("⏳ Peringatan batas 50 terdeteksi di web. Menunggu jeda web selesai…")
+        } else if (sawLimit50 && !postLimit50CooldownApplied) {
+            // Jeda web (10-30 mnt) baru saja selesai -> beri jeda tambahan 5-10 menit di sistem
+            sawLimit50 = false
+            postLimit50CooldownApplied = true
+            val extraMs = Random.nextLong(5 * 60_000L, 10 * 60_000L + 1)
+            nextAllowedAt = maxOf(nextAllowedAt, now + extraMs)
+            val mins = (extraMs + 30_000L) / 60_000L
+            setStatus("⏳ Jeda web 50 selesai. Jeda sistem tambahan ~$mins menit…")
+            return
+        }
+
+        if (now < nextAllowedAt) {
+            val remSec = (nextAllowedAt - now) / 1000
+            val remMin = remSec / 60
+            val remModSec = remSec % 60
+            setStatus("⏸ Jeda aktif: ${remMin}m ${remModSec}d lagi…")
+            return
+        }
+
+        // Prioritas 1: Cek apakah ada modal/tugas "sedang dikerjakan"
+        val hasInProgressModal = lines.any { it.norm.contains("sedang dikerjakan") }
+        val check = lines.firstOrNull {
+            it.norm.contains("periksa follow saya") ||
+                (it.norm.contains("periksa") && (it.norm.contains("follow") || it.norm.contains("saya") || it.norm.contains("tugas")))
+        }
+        val submitBtn = lines.firstOrNull {
+            it.norm.contains("dikirim untuk ditinjau") || it.norm.contains("kirim untuk ditinjau")
+        }
+        val reviewed = lines.any { it.norm.contains("ditinjau") || it.norm.contains("disetujui") }
         val startBtn = lines.firstOrNull {
             it.norm.startsWith("mulai") && !it.norm.contains("dalam") && it.norm.any { c -> c.isDigit() }
         }
-        val confirmMark = lines.any { it.norm.contains("konfirmasi follow anda") }
-        val modalOpen = check != null || startBtn != null || confirmMark || reviewed
+        val confirmMark = lines.any { it.norm.contains("konfirmasi follow anda") || it.norm.contains("konfirmasi") }
+        val modalOpen = hasInProgressModal || check != null || submitBtn != null || startBtn != null || confirmMark || reviewed
 
-        if (phase == Phase.CHECKING && (check == null || reviewed)) {
+        if (phase == Phase.CHECKING && (!modalOpen || reviewed)) {
             onTaskDone(now)
             return
         }
 
-        // Misi yang minta screenshot tidak bisa dikerjakan bot -> batalkan + refresh web
-        if (check == null && isScreenshotMission(lines, confirmMark)) {
-            handleScreenshotMission(now)
+        if (submitBtn != null) {
+            tap(submitBtn.rect)
+            phase = Phase.CHECKING
+            phaseSince = now
+            setStatus("Mengirim tugas untuk ditinjau…")
             return
         }
 
         if (check == null && startBtn != null) {
-            if (!canStartNew(now)) return
             tap(startBtn.rect)
             phase = Phase.LIST
             phaseSince = now
@@ -536,7 +555,6 @@ class AutomationService : AccessibilityService() {
 
         val nextBtn = lines.firstOrNull { it.norm.contains("tugas berikutnya") }
         if (check == null && nextBtn != null) {
-            if (!canStartNew(now)) return
             tap(nextBtn.rect)
             phase = Phase.LIST
             phaseSince = now
@@ -546,14 +564,9 @@ class AutomationService : AccessibilityService() {
 
         if (!modalOpen) {
             if (phase == Phase.LIST) {
-                // 1. Setelah refresh halaman kembali ke "Semua": klik logo Instagram dulu
-                if (needIgTab && selectInstagramTab(lines, now)) return
-                // 2. Ada "Tugas sedang dikerjakan": kerjakan yang itu dulu (prioritas)
-                if (resumeInProgress(lines, now)) return
-                // 3. Baru ambil tugas baru
                 listStep(lines, now)
             } else if (now - phaseSince > 15000) {
-                doRefresh(now, "Halaman tugas macet")
+                resetTask()
             } else {
                 setStatus("Menunggu halaman tugas…")
             }
@@ -561,50 +574,44 @@ class AutomationService : AccessibilityService() {
         }
 
         if (check == null) {
-            // modal terbuka tapi belum jelas, tunggu (kalau kelamaan -> refresh)
-            setStatus("Menunggu jendela tugas…")
-            markStall(now, "Jendela tugas tidak muncul")
+            setStatus("Menunggu jendela tugas sedang dikerjakan…")
             return
         }
 
         when (phase) {
             Phase.LIST -> {
-                if (!canStartNew(now)) return
                 targetUser = parseTarget(lines)
                 tapLink(lines)
-                phase = Phase.IN_INSTAGRAM
+                phase = Phase.IN_SOCIAL
                 phaseSince = now
-                linkWaitSince = now
-                resumeTaps = 0
                 checkAttempts = 0
-                igRetries = 0
-                igAttempts = 0
+                socialRetries = 0
+                socialAttempts = 0
                 verifiedFollow = false
                 cancelAfterReturn = false
                 tapY = -1
-                setStatus("Membuka profil Instagram…")
+                setStatus("Membuka profil target…")
             }
-            Phase.IN_INSTAGRAM -> {
-                // Masih di halaman tugas: link belum membuka Instagram
+            Phase.IN_SOCIAL -> {
                 if (now - phaseSince > 8000) {
-                    igAttempts++
-                    if (igAttempts >= MAX_PROFILE_TRIES) {
+                    socialAttempts++
+                    if (socialAttempts >= MAX_PROFILE_TRIES) {
                         cancelTask(lines, now)
                     } else {
                         tapLink(lines)
                         phaseSince = now
-                        setStatus("Link belum terbuka, coba lagi ($igAttempts/$MAX_PROFILE_TRIES)")
+                        setStatus("Link belum terbuka, coba lagi ($socialAttempts/$MAX_PROFILE_TRIES)")
                     }
                 }
             }
-            Phase.IG_CLICKED, Phase.RETURNING -> {
+            Phase.SOCIAL_CLICKED, Phase.RETURNING -> {
                 if (cancelAfterReturn) {
                     cancelTask(lines, now)
                 } else if (!verifiedFollow) {
                     tapLink(lines)
-                    phase = Phase.IN_INSTAGRAM
+                    phase = Phase.IN_SOCIAL
                     phaseSince = now
-                    setStatus("Membuka ulang profil Instagram…")
+                    setStatus("Membuka ulang profil target…")
                 } else {
                     tap(check.rect)
                     phase = Phase.CHECKING
@@ -628,55 +635,112 @@ class AutomationService : AccessibilityService() {
         }
     }
 
+    /**
+     * Prioritas 2: TikTok ("Ikuti di TikTok")
+     * Prioritas 3: Instagram ("Ikuti di Instagram")
+     * Jika misi Follow/Ikuti habis -> refresh halaman web lalu pilih Instagram.
+     */
     private fun listStep(lines: List<OcrLine>, now: Long) {
-        if (!canStartNew(now)) return
         val h = resources.displayMetrics.heightPixels
-        val row = lines
+
+        val tiktokRow = lines
             .filter {
-                it.norm.contains("ikuti di instagram") &&
-                    !it.norm.contains("dimulai") && !it.norm.contains("dikerjakan") &&
-                    it.rect.centerY() > h * 0.18 && it.rect.centerY() < h * 0.85
+                it.norm.contains("ikuti di tiktok") &&
+                    it.rect.centerY() > h * 0.25 && it.rect.centerY() < h * 0.88
             }
             .minByOrNull { it.rect.top }
-        if (row == null) {
-            idleTicks++
-            setStatus("Tidak ada tugas Follow terlihat (OCR ${lines.size} baris)")
-            if (idleTicks >= 4 && now - lastRefreshAt > 15000) {
-                idleTicks = 0
-                doRefresh(now, "Tugas habis")
+
+        val igRow = lines
+            .filter {
+                it.norm.contains("ikuti di instagram") &&
+                    it.rect.centerY() > h * 0.25 && it.rect.centerY() < h * 0.88
             }
+            .minByOrNull { it.rect.top }
+
+        if (tiktokRow != null) {
+            activeMode = PlatformMode.TIKTOK
+            idleTicks = 0
+            tap(tiktokRow.rect)
+            phaseSince = now
+            setStatus("Membuka tugas TikTok…")
             return
         }
-        idleTicks = 0
-        tap(row.rect)
-        phaseSince = now
-        setStatus("Membuka tugas…")
+
+        if (igRow != null) {
+            activeMode = PlatformMode.INSTAGRAM
+            idleTicks = 0
+            tap(igRow.rect)
+            phaseSince = now
+            setStatus("Membuka tugas Instagram…")
+            return
+        }
+
+        // Jika baris tugas belum kelihatan, cek apakah tab/chip TikTok atau Instagram perlu diklik
+        val ttTab = findPlatformChip(lines, h, isTikTok = true)
+        val igTab = findPlatformChip(lines, h, isTikTok = false)
+
+        if (activeMode == PlatformMode.TIKTOK && ttTab != null && idleTicks < 2) {
+            idleTicks++
+            tap(ttTab.rect)
+            setStatus("Memilih tab TikTok (Prioritas 2)…")
+            return
+        }
+
+        if (igTab != null && (activeMode == PlatformMode.INSTAGRAM || idleTicks >= 2)) {
+            activeMode = PlatformMode.INSTAGRAM
+            tap(igTab.rect)
+            setStatus("Memilih tab Instagram (Prioritas 3)…")
+            return
+        }
+
+        // Misi Follow/Ikuti habis -> refresh halaman lalu arahkan ke Instagram
+        idleTicks++
+        setStatus("Misi Follow/Ikuti belum terlihat ($idleTicks)")
+        if (idleTicks >= 3 && now - lastRefreshAt > 12_000) {
+            idleTicks = 0
+            lastRefreshAt = now
+            activeMode = PlatformMode.INSTAGRAM
+            setStatus("Misi Follow/Ikuti habis, refresh lalu ke Instagram…")
+            refreshPageToInstagram()
+        }
+    }
+
+    private fun findPlatformChip(lines: List<OcrLine>, h: Int, isTikTok: Boolean): OcrLine? {
+        val topBand = (h * 0.14).toInt()..(h * 0.34).toInt()
+        return lines.firstOrNull { line ->
+            if (line.rect.centerY() !in topBand) return@firstOrNull false
+            val n = line.norm
+            if (isTikTok) {
+                n == "tiktok" || (n.contains("tiktok") && !n.contains("ikuti di tiktok"))
+            } else {
+                n == "instagram" || (n.contains("instagram") && !n.contains("ikuti di instagram"))
+            }
+        }
     }
 
     private fun tapLink(lines: List<OcrLine>) {
-        val link = lines.firstOrNull { it.norm.contains("instagram.com") }
-            ?: lines.firstOrNull { it.norm.contains("buka profil dan ikuti") }
+        val link = lines.firstOrNull {
+            it.norm.contains("instagram.com") || it.norm.contains("tiktok.com")
+        } ?: lines.firstOrNull {
+            it.norm.contains("buka profil dan ikuti") || it.norm.contains("buka profil")
+        }
         if (link != null) tap(link.rect)
-    }
-
-    private fun canStartNew(now: Long): Boolean {
-        if (now < nextAllowedAt) {
-            setStatus("Jeda ${(nextAllowedAt - now) / 1000} detik…")
-            return false
-        }
-        if (recentCount(now) >= MAX_PER_HOUR) {
-            setStatus("Batas $MAX_PER_HOUR per jam tercapai. Menunggu…")
-            return false
-        }
-        return true
     }
 
     private fun onTaskDone(now: Long) {
         doneCount++
-        doneTimes.add(now)
         resetTask()
-        nextAllowedAt = now + Random.nextLong(2000, 4000)
-        setStatus("✅ Tugas selesai. Jeda sebelum tugas berikutnya.")
+
+        // Setiap 10 misi selesai -> jeda acak 3-5 menit
+        if (doneCount % 10 == 0) {
+            val breakMs = Random.nextLong(3 * 60_000L, 5 * 60_000L + 1)
+            nextAllowedAt = now + breakMs
+            val mins = (breakMs + 30_000L) / 60_000L
+            setStatus("✅ $doneCount misi selesai! Jeda rutin ~$mins menit (3-5 mnt)…")
+        } else {
+            nextAllowedAt = now + Random.nextLong(2000, 4000)
+            setStatus("✅ Tugas selesai ($doneCount). Lanjut misi berikutnya…")
+        }
     }
 
     private fun cancelTask(lines: List<OcrLine>, now: Long) {
@@ -690,154 +754,11 @@ class AutomationService : AccessibilityService() {
         phase = Phase.LIST
         phaseSince = System.currentTimeMillis()
         checkAttempts = 0
-        igRetries = 0
-        igAttempts = 0
+        socialRetries = 0
+        socialAttempts = 0
         verifiedFollow = false
         cancelAfterReturn = false
         tapY = -1
-        linkWaitSince = 0L
-        taskRefreshes = 0
-    }
-
-    private fun recentCount(now: Long): Int {
-        doneTimes.removeAll { now - it > 3_600_000L }
-        return doneTimes.size
-    }
-
-    // ---------------------------------------------------------------- Refresh, tab, prioritas
-
-    /** Refresh halaman web. Setelah refresh halaman balik ke tab "Semua", jadi tab Instagram diklik lagi. */
-    private fun doRefresh(now: Long, msg: String) {
-        val keep = taskRefreshes
-        resetTask()
-        taskRefreshes = keep
-        needIgTab = true
-        igTabTaps = 0
-        resumeTaps = 0
-        stallSince = 0L
-        lastRefreshAt = now
-        pageLoadUntil = now + PAGE_LOAD_WAIT
-        setStatus("$msg → refresh halaman…")
-        refreshPage()
-    }
-
-    /** Bot macet di satu keadaan terlalu lama -> refresh web. */
-    private fun markStall(now: Long, why: String): Boolean {
-        stallMarked = true
-        if (stallSince == 0L) stallSince = now
-        if (now - stallSince >= STALL_REFRESH_TIMEOUT) {
-            stallSince = 0L
-            doRefresh(now, why)
-            return true
-        }
-        return false
-    }
-
-    /** Link profil IG tidak jalan ~28 detik sejak tugas dibuka -> refresh (setelah 3x refresh: batalkan tugas). */
-    private fun linkWatchdog(now: Long): Boolean {
-        if (linkWaitSince == 0L || verifiedFollow) return false
-        if (phase != Phase.IN_INSTAGRAM && phase != Phase.IG_CLICKED && phase != Phase.RETURNING) return false
-        if (now - linkWaitSince < LINK_REFRESH_TIMEOUT) return false
-        linkWaitSince = 0L
-        if (taskRefreshes >= MAX_TASK_REFRESH) {
-            cancelAfterReturn = true
-            phase = Phase.RETURNING
-            phaseSince = now
-            launchBrowser()
-            setStatus("Link tetap tidak jalan setelah $taskRefreshes× refresh, tugas dibatalkan")
-        } else {
-            taskRefreshes++
-            doRefresh(now, "Link profil tidak jalan ${LINK_REFRESH_TIMEOUT / 1000} detik")
-        }
-        return true
-    }
-
-    /** Klik logo Instagram (tab ke-2, di sebelah kanan "Semua"). true = masih sibuk di langkah ini. */
-    private fun selectInstagramTab(lines: List<OcrLine>, now: Long): Boolean {
-        // Sudah di tab Instagram? judul daftar: "19 tugas · @akun"
-        val onIg = lines.any {
-            it.norm.contains("tugas") && it.norm.contains("@") && it.norm.firstOrNull()?.isDigit() == true
-        }
-        if (onIg) {
-            needIgTab = false
-            igTabTaps = 0
-            return false
-        }
-        if (igTabTaps >= 3) {
-            needIgTab = false
-            return false
-        }
-        if (now - lastTabTapAt < 1800) {
-            setStatus("Menunggu tab Instagram terbuka…")
-            return true
-        }
-        val semua = lines.filter { it.norm == "semua" }.minByOrNull { it.rect.top }
-        if (semua == null) {
-            igTabTaps++
-            setStatus("Mencari tab Instagram…")
-            return true
-        }
-        val w = resources.displayMetrics.widthPixels
-        val nums = lines.filter {
-            Regex("^\\+?\\d+$").matches(it.norm) &&
-                abs(it.rect.centerY() - semua.rect.centerY()) < 45 &&
-                it.rect.centerX() > semua.rect.centerX()
-        }.sortedBy { it.rect.centerX() }
-        val target = nums.firstOrNull()?.rect ?: Rect().apply {
-            val cx = (semua.rect.centerX() + w * 0.192f).toInt()
-            val cy = semua.rect.centerY() - 40
-            set(cx - 10, cy - 10, cx + 10, cy + 10)
-        }
-        tap(target)
-        igTabTaps++
-        lastTabTapAt = now
-        setStatus("Klik logo Instagram dulu ($igTabTaps/3)…")
-        return true
-    }
-
-    /** Banner "Tugas sedang dikerjakan" + tombol Lanjutkan: dahulukan tugas itu. true = sedang diurus. */
-    private fun resumeInProgress(lines: List<OcrLine>, now: Long): Boolean {
-        val banner = lines.firstOrNull { it.norm.contains("tugas sedang dikerjakan") } ?: return false
-        val btn = lines
-            .filter { it.norm.contains("lanjutkan") && abs(it.rect.centerY() - banner.rect.centerY()) < 160 }
-            .minByOrNull { abs(it.rect.centerY() - banner.rect.centerY()) }
-            ?: banner
-        if (now - lastResumeAt < 3000) {
-            setStatus("Menunggu tugas yang sedang dikerjakan terbuka…")
-            return true
-        }
-        if (resumeTaps >= 4) {
-            resumeTaps = 0
-            doRefresh(now, "Tombol Lanjutkan tidak merespons")
-            return true
-        }
-        resumeTaps++
-        lastResumeAt = now
-        tap(btn.rect)
-        setStatus("Ada tugas sedang dikerjakan, dilanjutkan dulu ($resumeTaps/4)…")
-        return true
-    }
-
-    private fun isScreenshotMission(lines: List<OcrLine>, confirmMark: Boolean): Boolean {
-        // Misi Follow biasa menulis "Tangkapan layar tidak diperlukan" -> bukan misi screenshot
-        if (confirmMark) return false
-        val modalHint = lines.any {
-            it.norm.contains("batalkan tugas") || it.norm.contains("tautan tidak berfungsi") ||
-                it.norm.contains("bayaran")
-        }
-        if (!modalHint) return false
-        return lines.any {
-            val n = it.norm
-            (n.contains("tangkapan layar") || n.contains("screenshot") || n.contains("unggah bukti") ||
-                n.contains("upload bukti") || n.contains("kirim bukti")) &&
-                !n.contains("tidak") && !n.contains("diperlukan") && !n.contains("not required")
-        }
-    }
-
-    /** Misi minta screenshot (biasanya muncul kalau klik profil >5x): cukup refresh web.
-     *  Misinya akan muncul lagi di banner "Tugas sedang dikerjakan" dan dilanjutkan lewat Lanjutkan. */
-    private fun handleScreenshotMission(now: Long) {
-        doRefresh(now, "Misi minta screenshot")
     }
 
     // ---------------------------------------------------------------- Aksi
@@ -852,13 +773,11 @@ class AutomationService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
-    private fun refreshPage() {
+    private fun refreshPageToInstagram() {
         val pkg = browserPkg ?: return
         try {
-            val i = Intent(Intent.ACTION_VIEW, Uri.parse(TASKS_URL))
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://pr.social/tasks?net=instagram"))
                 .setPackage(pkg)
-                // pakai ulang tab yang sama (tidak menumpuk tab baru) di Chrome
-                .putExtra("com.android.browser.application_id", packageName)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(i)
         } catch (_: Exception) {}
@@ -875,19 +794,14 @@ class AutomationService : AccessibilityService() {
 
     companion object {
         private const val IG_PACKAGE = "com.instagram.android"
-        private const val MAX_PER_HOUR = 50
+        private const val TIKTOK_PACKAGE = "com.zhiliaoapp.musically"
         private const val MAX_PROFILE_TRIES = 5
         private const val PROFILE_TIMEOUT = 25_000L
-        private const val LINK_REFRESH_TIMEOUT = 28_000L   // link profil IG tidak jalan -> refresh web
-        private const val STALL_REFRESH_TIMEOUT = 25_000L  // bot macet -> refresh web
-        private const val PAGE_LOAD_WAIT = 4_500L
-        private const val MAX_TASK_REFRESH = 3
-        private const val TASKS_URL = "https://pr.social/tasks"
         private val FOLLOW_WORDS = setOf("ikuti", "follow")
         private val FOLLOWING_WORDS = setOf("mengikuti", "following", "diminta", "requested")
         private val ANCHOR_WORDS = setOf(
             "kirim", "pesan", "message", "berlangganan", "subscribe", "kontak", "hubungi",
-            "contact", "email", "telepon", "call", "petunjuk", "directions"
+            "contact", "email", "telepon", "call", "petunjuk", "directions", "mengikuti"
         )
         private val BUTTON_WORDS = setOf(
             "ikuti", "follow", "balik", "back", "kirim", "pesan", "message",
