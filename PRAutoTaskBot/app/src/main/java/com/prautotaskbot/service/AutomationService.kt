@@ -36,12 +36,12 @@ import kotlin.random.Random
  * Bot otomatis tugas "Ikuti di Instagram" & "Ikuti di TikTok" di PR.SOCIAL.
  * Alur kerja:
  * 1. Prioritas 1: Tugas "sedang dikerjakan" (lanjutkan/kirim/tugas berikutnya).
- * 2. Prioritas 2: TikTok (otomatis klik chip/tab TikTok & kerjakan "Ikuti di TikTok").
- * 3. Prioritas 3: Instagram (klik chip/tab Instagram & kerjakan "Ikuti di Instagram").
- * 4. Jeda tiap 10 misi selesai: acak 3-5 menit (180.000 - 300.000 ms).
- * 5. Tanpa limit internal 50/jam; saat muncul peringatan batas 50 di web (atau saat jeda
+ * 2. Di halaman Tugas saat mode "Semua": klik logo/kartu TikTok -> kerjakan misi Follow/Ikuti.
+ * 3. Jika misi TikTok habis -> refresh web -> klik logo/kartu Instagram -> kerjakan misi Follow/Ikuti.
+ * 4. Jika misi Instagram habis -> refresh web -> balik lagi ke logo/kartu TikTok (loop terus).
+ * 5. Jeda tiap 10 misi selesai: acak 3-5 menit (180.000 - 300.000 ms).
+ * 6. Tanpa limit internal 50/jam; saat muncul peringatan batas 50 di web (atau setelah jeda
  *    web selesai), terapkan jeda tambahan 5-10 menit (300.000 - 600.000 ms) lalu lanjutkan.
- * 6. Jika misi Follow/Ikuti habis, refresh halaman web lalu pilih tab/misi Instagram.
  */
 class AutomationService : AccessibilityService() {
 
@@ -179,7 +179,7 @@ class AutomationService : AccessibilityService() {
             nextAllowedAt = 0L
             sawLimit50 = false
             postLimit50CooldownApplied = false
-            setStatus("Bot jalan (Prioritas: Sedang Dikerjakan -> TikTok -> Instagram).")
+            setStatus("Bot jalan (Loop: TikTok -> Refresh -> Instagram -> Refresh).")
         } else {
             setStatus("Bot dimatikan.")
         }
@@ -216,6 +216,23 @@ class AutomationService : AccessibilityService() {
         }
     }
 
+    private fun isSocialScreen(pkg: String?, lines: List<OcrLine>): Boolean {
+        if (pkg == IG_PACKAGE || pkg == TIKTOK_PACKAGE) return true
+        val h = resources.displayMetrics.heightPixels
+        val hasFollowAction = lines.any { line ->
+            val n = line.norm
+            line.rect.centerY() < h * 0.55 &&
+                (n == "ikuti" || n == "follow" || n.startsWith("mengikuti") || n.startsWith("following"))
+        }
+        val hasSocialStats = lines.any { line ->
+            val n = line.norm
+            n.contains("pengikut") || n.contains("mengikuti") || n.contains("followers") ||
+                n.contains("postingan") || (n.contains("suka") && line.rect.centerY() < h * 0.30)
+        }
+        val hasAtHandle = lines.any { it.raw.trim().startsWith("@") && it.rect.centerY() < h * 0.30 }
+        return hasFollowAction && (hasSocialStats || hasAtHandle)
+    }
+
     private suspend fun tick() {
         val now = System.currentTimeMillis()
         val pkg = rootInActiveWindow?.packageName?.toString() ?: currentPkg
@@ -231,8 +248,11 @@ class AutomationService : AccessibilityService() {
         val ov = overlayRect()
         val lines = all.filter { !ov.contains(it.rect.centerX(), it.rect.centerY()) }
 
-        if (pkg == IG_PACKAGE || pkg == TIKTOK_PACKAGE) {
-            handleSocialApp(pkg, lines, now)
+        // Deteksi layar TikTok/Instagram baik dari packageName maupun dari isi OCR
+        // agar tidak nyasar ke "Halaman Tugas tidak terlihat" saat packageName terlambat terdeteksi.
+        if (isSocialScreen(pkg, lines)) {
+            val detectedPkg = pkg ?: if (activeMode == PlatformMode.TIKTOK) TIKTOK_PACKAGE else IG_PACKAGE
+            handleSocialApp(detectedPkg, lines, now)
             return
         }
 
@@ -241,6 +261,7 @@ class AutomationService : AccessibilityService() {
             n.contains("ikuti di instagram") || n.contains("ikuti di tiktok") ||
                 n.contains("periksa follow saya") || n.contains("buka profil dan ikuti") ||
                 n.contains("tugas saya") || n.contains("sedang dikerjakan") ||
+                n.contains("semua platform") || n.contains("bayaran tertinggi") ||
                 n.contains("batas per jam tercapai") || n.contains("jeda untuk menjaga akun")
         }
         if (looksPr) {
@@ -335,16 +356,17 @@ class AutomationService : AccessibilityService() {
         val h = resources.displayMetrics.heightPixels
         val allWords = lines.flatMap { it.words }
 
-        // Batas atas: di bawah baris statistik (postingan/pengikut/mengikuti)
+        // Batas atas: di bawah baris statistik (postingan/pengikut/mengikuti/suka)
         val statY = allWords
             .filter {
                 it.norm == "postingan" || it.norm == "posts" ||
                     it.norm == "pengikut" || it.norm == "followers" ||
-                    it.norm == "mengikuti" || it.norm == "following"
+                    it.norm == "mengikuti" || it.norm == "following" ||
+                    it.norm == "suka" || it.norm == "likes"
             }
             .filter { it.rect.centerY() < h * 0.35 }
             .maxOfOrNull { it.rect.centerY() } ?: (h * 0.16).toInt()
-        val topLimit = statY + 30
+        val topLimit = statY + 25
 
         // Batas bawah: sebelum "Disarankan untuk Anda" / "Suggested for you"
         val headingY = lines
@@ -367,7 +389,7 @@ class AutomationService : AccessibilityService() {
         fun pick(pred: (OcrWord) -> Boolean): OcrWord? {
             if (anchorYs.isNotEmpty()) {
                 zoneLines.flatMap { it.words }
-                    .filter { pred(it) && anchorYs.any { y -> abs(y - it.rect.centerY()) < 75 } }
+                    .filter { pred(it) && anchorYs.any { y -> abs(y - it.rect.centerY()) < 85 } }
                     .minByOrNull { it.rect.centerY() }
                     ?.let { return it }
             }
@@ -388,6 +410,11 @@ class AutomationService : AccessibilityService() {
 
         val onTarget = headerMatchesTarget(lines, h)
         val platformLabel = if (pkg == TIKTOK_PACKAGE) "TikTok" else "Instagram"
+
+        if (phase != Phase.IN_SOCIAL && phase != Phase.SOCIAL_CLICKED && phase != Phase.RETURNING) {
+            phase = Phase.IN_SOCIAL
+            phaseSince = now
+        }
 
         when (phase) {
             Phase.IN_SOCIAL -> {
@@ -428,7 +455,7 @@ class AutomationService : AccessibilityService() {
                 }
             }
             Phase.RETURNING -> {
-                if (now - phaseSince > 2500) {
+                if (now - phaseSince > 2200) {
                     launchBrowser()
                     phaseSince = now
                 }
@@ -636,9 +663,11 @@ class AutomationService : AccessibilityService() {
     }
 
     /**
-     * Prioritas 2: TikTok ("Ikuti di TikTok")
-     * Prioritas 3: Instagram ("Ikuti di Instagram")
-     * Jika misi Follow/Ikuti habis -> refresh halaman web lalu pilih Instagram.
+     * Alur daftar tugas saat berada di halaman Tugas (termasuk dari tab "Semua"):
+     * - Jika sedang di mode TIKTOK: klik kartu/logo TikTok dulu bila belum aktif, lalu klik baris "Ikuti di TikTok".
+     *   Jika misi TikTok habis -> refresh web -> pindah ke mode INSTAGRAM.
+     * - Jika sedang di mode INSTAGRAM: klik kartu/logo Instagram bila belum aktif, lalu klik baris "Ikuti di Instagram".
+     *   Jika misi Instagram habis -> refresh web -> balik lagi ke mode TIKTOK (loop terus).
      */
     private fun listStep(lines: List<OcrLine>, now: Long) {
         val h = resources.displayMetrics.heightPixels
@@ -657,58 +686,72 @@ class AutomationService : AccessibilityService() {
             }
             .minByOrNull { it.rect.top }
 
-        if (tiktokRow != null) {
-            activeMode = PlatformMode.TIKTOK
-            idleTicks = 0
-            tap(tiktokRow.rect)
-            phaseSince = now
-            setStatus("Membuka tugas TikTok…")
-            return
-        }
+        val ttLogo = findPlatformLogoCard(lines, h, isTikTok = true)
+        val igLogo = findPlatformLogoCard(lines, h, isTikTok = false)
+        val isAllPlatformView = lines.any { it.norm.contains("semua platform") }
 
-        if (igRow != null) {
-            activeMode = PlatformMode.INSTAGRAM
-            idleTicks = 0
-            tap(igRow.rect)
-            phaseSince = now
-            setStatus("Membuka tugas Instagram…")
-            return
-        }
-
-        // Jika baris tugas belum kelihatan, cek apakah tab/chip TikTok atau Instagram perlu diklik
-        val ttTab = findPlatformChip(lines, h, isTikTok = true)
-        val igTab = findPlatformChip(lines, h, isTikTok = false)
-
-        if (activeMode == PlatformMode.TIKTOK && ttTab != null && idleTicks < 2) {
+        if (activeMode == PlatformMode.TIKTOK) {
+            if (tiktokRow != null) {
+                idleTicks = 0
+                tap(tiktokRow.rect)
+                phaseSince = now
+                setStatus("Membuka tugas Ikuti di TikTok…")
+                return
+            }
+            // Dari tampilan "Semua", klik logo/kartu TikTok terlebih dahulu
+            if (ttLogo != null && (isAllPlatformView || idleTicks < 2)) {
+                idleTicks++
+                tap(ttLogo.rect)
+                setStatus("Menekan logo TikTok…")
+                return
+            }
+            // Misi TikTok habis -> refresh halaman lalu ganti ke Instagram
             idleTicks++
-            tap(ttTab.rect)
-            setStatus("Memilih tab TikTok (Prioritas 2)…")
-            return
-        }
-
-        if (igTab != null && (activeMode == PlatformMode.INSTAGRAM || idleTicks >= 2)) {
-            activeMode = PlatformMode.INSTAGRAM
-            tap(igTab.rect)
-            setStatus("Memilih tab Instagram (Prioritas 3)…")
-            return
-        }
-
-        // Misi Follow/Ikuti habis -> refresh halaman lalu arahkan ke Instagram
-        idleTicks++
-        setStatus("Misi Follow/Ikuti belum terlihat ($idleTicks)")
-        if (idleTicks >= 3 && now - lastRefreshAt > 12_000) {
-            idleTicks = 0
-            lastRefreshAt = now
-            activeMode = PlatformMode.INSTAGRAM
-            setStatus("Misi Follow/Ikuti habis, refresh lalu ke Instagram…")
-            refreshPageToInstagram()
+            setStatus("Misi TikTok habis / belum ada ($idleTicks)")
+            if (idleTicks >= 3 && now - lastRefreshAt > 10_000) {
+                idleTicks = 0
+                lastRefreshAt = now
+                activeMode = PlatformMode.INSTAGRAM
+                setStatus("Misi TikTok habis, refresh lalu ke Instagram…")
+                refreshBrowserPage()
+            }
+        } else {
+            if (igRow != null) {
+                idleTicks = 0
+                tap(igRow.rect)
+                phaseSince = now
+                setStatus("Membuka tugas Ikuti di Instagram…")
+                return
+            }
+            // Klik logo/kartu Instagram terlebih dahulu bila terlihat
+            if (igLogo != null && (isAllPlatformView || idleTicks < 2)) {
+                idleTicks++
+                tap(igLogo.rect)
+                setStatus("Menekan logo Instagram…")
+                return
+            }
+            // Misi Instagram habis -> refresh halaman lalu balik ke TikTok
+            idleTicks++
+            setStatus("Misi Instagram habis / belum ada ($idleTicks)")
+            if (idleTicks >= 3 && now - lastRefreshAt > 10_000) {
+                idleTicks = 0
+                lastRefreshAt = now
+                activeMode = PlatformMode.TIKTOK
+                setStatus("Misi Instagram habis, refresh lalu balik ke TikTok…")
+                refreshBrowserPage()
+            }
         }
     }
 
-    private fun findPlatformChip(lines: List<OcrLine>, h: Int, isTikTok: Boolean): OcrLine? {
-        val topBand = (h * 0.14).toInt()..(h * 0.34).toInt()
-        return lines.firstOrNull { line ->
-            if (line.rect.centerY() !in topBand) return@firstOrNull false
+    /**
+     * Cari kartu/logo platform di baris atas halaman Tugas (di bawah header PR Tugas).
+     * Di screenshot "Semua", kartu platform berada di baris atas (sekitar 12%-25% tinggi layar)
+     * dan biasanya menampilkan angka jumlah tugas (mis. 45 atau 83).
+     */
+    private fun findPlatformLogoCard(lines: List<OcrLine>, h: Int, isTikTok: Boolean): OcrLine? {
+        val topBand = (h * 0.12).toInt()..(h * 0.26).toInt()
+        val candidates = lines.filter { line ->
+            if (line.rect.centerY() !in topBand) return@filter false
             val n = line.norm
             if (isTikTok) {
                 n == "tiktok" || (n.contains("tiktok") && !n.contains("ikuti di tiktok"))
@@ -716,6 +759,18 @@ class AutomationService : AccessibilityService() {
                 n == "instagram" || (n.contains("instagram") && !n.contains("ikuti di instagram"))
             }
         }
+        if (candidates.isNotEmpty()) return candidates.first()
+
+        // Kartu logo di baris atas sering terbaca sebagai angka jumlah tugas (mis. "83" untuk TikTok, "45" untuk IG)
+        val numCards = lines.filter { line ->
+            line.rect.centerY() in topBand && line.norm.matches(Regex("\\d+"))
+        }.sortedBy { it.rect.left }
+
+        if (numCards.size >= 2) {
+            // Biasanya urutan dari kiri ke kanan di baris logo: [Instagram, TikTok, YouTube, ...]
+            return if (isTikTok) numCards[1] else numCards[0]
+        }
+        return null
     }
 
     private fun tapLink(lines: List<OcrLine>) {
@@ -773,10 +828,10 @@ class AutomationService : AccessibilityService() {
         } catch (_: Exception) {}
     }
 
-    private fun refreshPageToInstagram() {
+    private fun refreshBrowserPage() {
         val pkg = browserPkg ?: return
         try {
-            val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://pr.social/tasks?net=instagram"))
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse("https://pr.social/tasks"))
                 .setPackage(pkg)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(i)
