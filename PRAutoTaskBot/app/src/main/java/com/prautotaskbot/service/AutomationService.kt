@@ -467,7 +467,7 @@ class AutomationService : AccessibilityService() {
 
     private fun platformOfPackage(pkg: String?): Platform? = when {
         pkg == null -> null
-        pkg == IG_PACKAGE -> Platform.INSTAGRAM
+        pkg == IG_PACKAGE || pkg == "com.instagram.lite" -> Platform.INSTAGRAM   // termasuk Instagram Lite
         pkg in TIKTOK_PACKAGES -> Platform.TIKTOK
         else -> null
     }
