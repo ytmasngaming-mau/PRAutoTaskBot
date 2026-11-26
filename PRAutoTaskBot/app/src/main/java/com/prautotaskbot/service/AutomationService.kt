@@ -120,6 +120,8 @@ class AutomationService : AccessibilityService() {
     private var pageLoadUntil = 0L
     private var stallSince = 0L
     private var stallMarked = false
+    private var igPreTapAt = 0L         // waktu tombol Ikuti Instagram pertama terlihat (untuk jeda sebelum menekan)
+    private var igPreTapDelay = 0L
     private var statusText = "Siap. Tekan tombol untuk mulai."
 
     override fun onServiceConnected() {
@@ -492,7 +494,7 @@ class AutomationService : AccessibilityService() {
         // Baris yang HANYA berisi kata tombol (Ikuti, Kirim Pesan, Berlangganan, Kontak, dst).
         // Kalimat bio seperti "Ikuti kami di TikTok" tidak lolos.
         val strictLines = zoneLines.filter { l ->
-            l.words.all { it.norm in BUTTON_WORDS || it.norm.length <= 2 || it.norm.startsWith("mengik") }
+            l.words.all { it.norm in BUTTON_WORDS || it.norm.length <= 2 || it.norm.startsWith("mengik") || isFollowingWord(it.norm, platform) }
         }
 
         // Jangkar: tombol milik profil ini selalu satu baris dengan tombol lain seperti Kirim Pesan.
@@ -520,10 +522,7 @@ class AutomationService : AccessibilityService() {
                 .minByOrNull { it.rect.centerY() }
         }
 
-        val following = pick {
-            it.norm.startsWith("mengik") || it.norm in FOLLOWING_WORDS ||
-                (platform == Platform.TIKTOK && it.norm in TIKTOK_FRIEND_WORDS)
-        }
+        val following = pick { isFollowingWord(it.norm, platform) }
         val followBtn = pick { it.norm in FOLLOW_WORDS }
         var followingRect: Rect? = following?.rect
         var followRect: Rect? = followBtn?.rect
@@ -534,6 +533,19 @@ class AutomationService : AccessibilityService() {
             val nodes = findButtonNodes(topLimit, bottomLimit)
             followRect = nodes.first
             followingRect = nodes.second
+        }
+        if (platform == Platform.TIKTOK && followingRect == null && followRect == null &&
+            (phase == Phase.IN_INSTAGRAM || phase == Phase.IG_CLICKED)
+        ) {
+            // TikTok: setelah Ikuti, tombol kadang jadi hanya "Pesan" (atau "Diminta" yang tidak terbaca OCR).
+            // Tombol Ikuti sudah hilang dan tombol Pesan muncul = berarti sudah mengikuti / permintaan terkirim.
+            val minWait = if (phase == Phase.IG_CLICKED) 1200L else 5000L
+            if (now - phaseSince >= minWait) {
+                val msgBtn = strictLines.flatMap { it.words }
+                    .filter { it.norm == "pesan" || it.norm == "message" }
+                    .minByOrNull { it.rect.centerY() }
+                if (msgBtn != null) followingRect = msgBtn.rect
+            }
         }
         val followingOk = followingRect != null &&
             (tapY < 0 || abs(followingRect.centerY() - tapY) < 150)
@@ -572,6 +584,18 @@ class AutomationService : AccessibilityService() {
                     lastProfileHdr = hdrNow
                     returnToBrowser(now, "Sudah mengikuti")
                 } else if (followRect != null) {
+                    if (platform == Platform.INSTAGRAM) {
+                        // Khusus Instagram: jeda 2-3 detik dulu sebelum menekan Ikuti
+                        if (igPreTapAt == 0L) {
+                            igPreTapAt = now
+                            igPreTapDelay = Random.nextLong(2000, 3000)
+                        }
+                        if (now - igPreTapAt < igPreTapDelay) {
+                            setStatus("Tombol Ikuti ketemu, tunggu sebentar sebelum menekan…")
+                            return
+                        }
+                        igPreTapAt = 0L
+                    }
                     tap(followRect)
                     tapY = followRect.centerY()
                     phase = Phase.IG_CLICKED
@@ -649,6 +673,15 @@ class AutomationService : AccessibilityService() {
         val x = ocrNorm(a)
         val y = ocrNorm(b)
         return x == y || (minOf(x.length, y.length) >= 5 && (x.contains(y) || y.contains(x)))
+    }
+
+    /** Kata status "sudah mengikuti": Mengikuti, Diminta, Requested, Teman (TikTok), termasuk salah baca OCR. */
+    private fun isFollowingWord(norm: String, platform: Platform): Boolean {
+        if (norm.isEmpty()) return false
+        if (norm.startsWith("mengik") || norm in FOLLOWING_WORDS) return true
+        if (platform == Platform.TIKTOK && norm in TIKTOK_FRIEND_WORDS) return true
+        if (norm.startsWith("dimint") || norm.startsWith("request")) return true
+        return norm.length in 6..8 && ocrNorm(norm) == ocrNorm("diminta")
     }
 
     /** Samakan huruf yang sering tertukar oleh OCR. */
@@ -757,6 +790,7 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun returnToBrowser(now: Long, msg: String) {
+        igPreTapAt = 0L
         if (browserPkg != null) launchBrowser() else performGlobalAction(GLOBAL_ACTION_BACK)
         phase = Phase.RETURNING
         phaseSince = now
@@ -765,6 +799,7 @@ class AutomationService : AccessibilityService() {
 
     /** Gagal menemukan/menekan Ikuti: kembali ke web lalu buka profil lagi (bukan menekan Periksa). */
     private fun retryProfile(now: Long, msg: String) {
+        igPreTapAt = 0L
         igAttempts++
         verifiedFollow = false
         tapY = -1
@@ -1081,6 +1116,7 @@ class AutomationService : AccessibilityService() {
         cancelAfterReturn = false
         tapY = -1
         linkWaitSince = 0L
+        igPreTapAt = 0L
         taskRefreshes = 0
         acceptedProfileHdr = null
         mismatchHdr = ""
