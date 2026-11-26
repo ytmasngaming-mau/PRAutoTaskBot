@@ -2,6 +2,7 @@ package com.prautotaskbot
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
@@ -12,6 +13,7 @@ import androidx.navigation.ui.setupWithNavController
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.prautotaskbot.databinding.ActivityMainBinding
 import com.prautotaskbot.service.FloatingBubbleService
+import com.prautotaskbot.service.ScreenCaptureService
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -32,6 +34,11 @@ class MainActivity : AppCompatActivity() {
 
         // Cek permission overlay saat startup (untuk floating bubble)
         checkOverlayPermission()
+
+        // HP Android 10 ke bawah: minta izin rekam layar supaya bot bisa membaca layar
+        if (Build.VERSION.SDK_INT < 30 && !ScreenCaptureService.isReady()) {
+            startActivity(Intent(this, ScreenCapturePermissionActivity::class.java))
+        }
     }
 
     private fun checkOverlayPermission() {
