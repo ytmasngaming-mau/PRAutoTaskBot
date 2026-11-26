@@ -23,6 +23,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import com.prautotaskbot.ScreenCapturePermissionActivity
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -153,6 +154,7 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun stopAll() {
+        ScreenCaptureService.stop(this)
         loopJob?.cancel()
         job.cancel()
         overlay?.let {
@@ -341,7 +343,11 @@ class AutomationService : AccessibilityService() {
 
         val bmp = captureBitmap()
         if (bmp == null) {
-            setStatus("Gagal potret layar (kode $lastShotError)")
+            if (lastShotError == -10) {
+                setStatus("Menunggu izin rekam layar: pilih 'Mulai sekarang'")
+            } else {
+                setStatus("Gagal potret layar (kode $lastShotError)")
+            }
             return
         }
         val all = ocr(bmp)
@@ -374,8 +380,17 @@ class AutomationService : AccessibilityService() {
 
     private suspend fun captureBitmap(): Bitmap? = suspendCancellableCoroutine { cont ->
         if (Build.VERSION.SDK_INT < 30) {
-            lastShotError = -1
-            cont.resume(null)
+            // Android 10 ke bawah: potret layar lewat izin rekam layar (ScreenCaptureService)
+            val shot = ScreenCaptureService.grab()
+            if (shot == null) {
+                if (!ScreenCaptureService.isReady()) {
+                    lastShotError = -10
+                    askScreenCapturePermission()
+                } else {
+                    lastShotError = -11
+                }
+            }
+            cont.resume(shot)
             return@suspendCancellableCoroutine
         }
         try {
@@ -405,6 +420,19 @@ class AutomationService : AccessibilityService() {
         } catch (e: Exception) {
             lastShotError = -3
             cont.resume(null)
+        }
+    }
+
+    /** Android 10 ke bawah: munculkan pop-up izin rekam layar (tidak diulang tiap detik). */
+    private fun askScreenCapturePermission() {
+        if (ScreenCapturePermissionActivity.showing) return
+        if (System.currentTimeMillis() - ScreenCapturePermissionActivity.lastAskAt < 20000L) return
+        try {
+            startActivity(
+                Intent(this, ScreenCapturePermissionActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (_: Exception) {
         }
     }
 
