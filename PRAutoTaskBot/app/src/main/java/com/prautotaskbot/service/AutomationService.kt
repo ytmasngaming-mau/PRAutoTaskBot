@@ -19,6 +19,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -96,6 +97,12 @@ class AutomationService : AccessibilityService() {
     private val blockedUntil = mutableMapOf<Platform, Long>()   // jeda dari situs / pembatasan app
     private val emptyUntil = mutableMapOf<Platform, Long>()     // misi follow platform ini habis
     private var waitingAll = false
+    private val zeroTicks = mutableMapOf<Platform, Int>()   // berapa tick berturut-turut angka tab = 0
+    private var loadingTicks = 0
+    private var lastProfileHdr = ""            // judul profil terakhir yang sudah diproses
+    private var acceptedProfileHdr: String? = null // profil beda nama dari situs yang diterima
+    private var mismatchHdr = ""
+    private var mismatchSince = 0L
     private var refreshAfterDone = false   // refresh web setiap satu misi selesai
     private val lastCount = mutableMapOf<Platform, Int>()      // angka di tab platform (jumlah misi)
     private val emptyAtCount = mutableMapOf<Platform, Int>()   // jumlah misi saat platform ditandai habis
@@ -266,6 +273,8 @@ class AutomationService : AccessibilityService() {
             staleList.clear()
             lastCount.clear()
             emptyAtCount.clear()
+            zeroTicks.clear()
+            loadingTicks = 0
             refreshAfterDone = false
             emptyUntil.clear()
             waitingAll = false
@@ -464,6 +473,10 @@ class AutomationService : AccessibilityService() {
             .filter { it.rect.centerY() < h * 0.30 }
             .maxOfOrNull { it.rect.centerY() } ?: (h * 0.15).toInt()
         val topLimit = statY + if (platform == Platform.TIKTOK) 25 else 40
+        val statFound = allWords.any {
+            (it.norm == "postingan" || it.norm == "posts" || it.norm == "pengikut" || it.norm == "followers") &&
+                it.rect.centerY() < h * 0.30
+        }
 
         // Batas bawah: sebelum "Disarankan untuk Anda" (di bawahnya ada tombol Ikuti akun lain!)
         val headingY = lines
@@ -512,10 +525,39 @@ class AutomationService : AccessibilityService() {
                 (platform == Platform.TIKTOK && it.norm in TIKTOK_FRIEND_WORDS)
         }
         val followBtn = pick { it.norm in FOLLOW_WORDS }
-        val followingOk = following != null &&
-            (tapY < 0 || abs(following.rect.centerY() - tapY) < 150)
+        var followingRect: Rect? = following?.rect
+        var followRect: Rect? = followBtn?.rect
+        if (followingRect == null && followRect == null &&
+            (phase == Phase.IN_INSTAGRAM || phase == Phase.IG_CLICKED)
+        ) {
+            // OCR tidak menemukan tombol (mis. teks putih di tombol biru): coba lewat pohon aksesibilitas
+            val nodes = findButtonNodes(topLimit, bottomLimit)
+            followRect = nodes.first
+            followingRect = nodes.second
+        }
+        val followingOk = followingRect != null &&
+            (tapY < 0 || abs(followingRect.centerY() - tapY) < 150)
 
-        val onTarget = headerMatchesTarget(lines, h, platform)
+        val hdrNow = profileHeader(lines, h, platform)
+        val acc = acceptedProfileHdr
+        var onTarget = headerMatchesTarget(lines, h, platform) || (acc != null && sameHdr(hdrNow, acc))
+        if (!onTarget && phase == Phase.IN_INSTAGRAM && statFound && hdrNow.isNotEmpty() &&
+            !sameHdr(hdrNow, lastProfileHdr) && (followRect != null || followingRect != null)
+        ) {
+            // Yang menentukan adalah LINK di misi, bukan username yang tertulis (bisa username lama, mis.
+            // @transikasi padahal profilnya @transitira). Link selalu membuka akun yang benar, jadi terima
+            // profil BARU (beda dari profil terakhir yang dikerjakan) yang sudah stabil sebentar.
+            if (sameHdr(hdrNow, mismatchHdr)) {
+                if (now - mismatchSince >= MISMATCH_ACCEPT_MS) {
+                    acceptedProfileHdr = hdrNow
+                    onTarget = true
+                    setStatus("Profil dari link dibuka (nama beda dari @${targetUser ?: "?"}), lanjut")
+                }
+            } else {
+                mismatchHdr = hdrNow
+                mismatchSince = now
+            }
+        }
 
         when (phase) {
             Phase.IN_INSTAGRAM -> {
@@ -525,12 +567,13 @@ class AutomationService : AccessibilityService() {
                     } else {
                         setStatus("Menunggu profil @${targetUser ?: "?"}…")
                     }
-                } else if (following != null) {
+                } else if (followingRect != null) {
                     verifiedFollow = true
+                    lastProfileHdr = hdrNow
                     returnToBrowser(now, "Sudah mengikuti")
-                } else if (followBtn != null) {
-                    tap(followBtn.rect)
-                    tapY = followBtn.rect.centerY()
+                } else if (followRect != null) {
+                    tap(followRect)
+                    tapY = followRect.centerY()
                     phase = Phase.IG_CLICKED
                     phaseSince = now
                     igRetries = 0
@@ -538,17 +581,18 @@ class AutomationService : AccessibilityService() {
                 } else if (now - phaseSince > PROFILE_TIMEOUT) {
                     retryProfile(now, "Tombol Ikuti tidak ketemu")
                 } else {
-                    setStatus("Mencari tombol Ikuti… (percobaan ${igAttempts + 1}/$MAX_PROFILE_TRIES)")
+                    setStatus("Mencari tombol Ikuti… (percobaan ${igAttempts + 1}/$MAX_PROFILE_TRIES, OCR ${lines.size} baris)")
                 }
             }
             Phase.IG_CLICKED -> {
                 if (onTarget && followingOk) {
                     verifiedFollow = true
+                    lastProfileHdr = hdrNow
                     returnToBrowser(now, "Berhasil mengikuti")
                 } else if (now - phaseSince > 3500) {
-                    if (onTarget && followBtn != null && igRetries < 2) {
+                    if (onTarget && followRect != null && igRetries < 2) {
                         igRetries++
-                        tap(followBtn.rect)
+                        tap(followRect)
                         phaseSince = now
                     } else {
                         retryProfile(now, "Ikuti belum berhasil")
@@ -569,7 +613,26 @@ class AutomationService : AccessibilityService() {
     private fun headerMatchesTarget(lines: List<OcrLine>, h: Int, platform: Platform): Boolean {
         val t = targetUser?.filter { it.isLetterOrDigit() } ?: return true
         if (t.length < 3) return true
-        val hdr = if (platform == Platform.TIKTOK) {
+        val hdr = profileHeader(lines, h, platform)
+        if (hdr.isEmpty()) return true
+        if (hdr.contains(t)) return true
+        if (hdr.length >= 5 && t.contains(hdr)) return true
+        var n = 0
+        while (n < hdr.length && n < t.length && hdr[n] == t[n]) n++
+        if (n >= minOf(6, t.length)) return true
+        // Belum cocok: OCR bisa salah baca (l/I/1, O/0) atau judul tertutup. Cari username di area atas yang lebih luas.
+        val wide = lines
+            .filter { it.rect.centerY() in (h * 0.03).toInt()..(h * 0.50).toInt() }
+            .joinToString("") { it.norm }
+            .filter { it.isLetterOrDigit() }
+        if (fuzzyContains(wide, t)) return true
+        // Terakhir: teks asli aplikasi lewat pohon aksesibilitas (tidak bergantung pada OCR)
+        return nodesContainTarget(t)
+    }
+
+    /** Teks judul profil (huruf/angka saja): Instagram = baris atas, TikTok = baris @username. */
+    private fun profileHeader(lines: List<OcrLine>, h: Int, platform: Platform): String =
+        if (platform == Platform.TIKTOK) {
             lines
                 .filter { it.rect.centerY() in (h * 0.04).toInt()..(h * 0.20).toInt() && it.text.contains("@") }
                 .joinToString("") { l -> l.text.substringAfter("@").lowercase() }
@@ -580,12 +643,97 @@ class AutomationService : AccessibilityService() {
                 .joinToString("") { it.norm }
                 .filter { it.isLetterOrDigit() }
         }
-        if (hdr.isEmpty()) return true
-        if (hdr.contains(t)) return true
-        if (hdr.length >= 5 && t.contains(hdr)) return true
-        var n = 0
-        while (n < hdr.length && n < t.length && hdr[n] == t[n]) n++
-        return n >= minOf(6, t.length)
+
+    private fun sameHdr(a: String, b: String): Boolean {
+        if (a.isEmpty() || b.isEmpty()) return false
+        val x = ocrNorm(a)
+        val y = ocrNorm(b)
+        return x == y || (minOf(x.length, y.length) >= 5 && (x.contains(y) || y.contains(x)))
+    }
+
+    /** Samakan huruf yang sering tertukar oleh OCR. */
+    private fun ocrNorm(x: String): String = buildString {
+        for (c in x.lowercase()) {
+            append(
+                when (c) {
+                    'i', 'l', '1', '|', '!' -> 'l'
+                    'o', '0', 'q' -> 'o'
+                    '5' -> 's'
+                    '8' -> 'b'
+                    '2' -> 'z'
+                    else -> c
+                }
+            )
+        }
+    }
+
+    /** Apakah [target] ada di dalam [text], dengan toleransi 1 salah huruf untuk nama panjang (>= 8 huruf). */
+    private fun fuzzyContains(text: String, target: String): Boolean {
+        if (target.length < 3 || text.isEmpty()) return false
+        val a = ocrNorm(target)
+        val b = ocrNorm(text)
+        if (b.contains(a)) return true
+        val tol = if (a.length >= 8) a.length / 8 else 0
+        if (tol == 0) return false
+        // jarak edit terkecil antara target dan potongan mana pun dari text
+        var prev = IntArray(b.length + 1)
+        for (i in 1..a.length) {
+            val cur = IntArray(b.length + 1)
+            cur[0] = i
+            for (j in 1..b.length) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                cur[j] = minOf(prev[j - 1] + cost, prev[j] + 1, cur[j - 1] + 1)
+            }
+            prev = cur
+        }
+        return (prev.minOrNull() ?: Int.MAX_VALUE) <= tol
+    }
+
+    private fun walkNodes(root: AccessibilityNodeInfo, visit: (AccessibilityNodeInfo) -> Unit) {
+        val stack = mutableListOf(root)
+        var guard = 0
+        while (stack.isNotEmpty() && guard++ < 2000) {
+            val node = stack.removeAt(stack.lastIndex)
+            visit(node)
+            for (i in 0 until node.childCount) node.getChild(i)?.let { stack.add(it) }
+        }
+    }
+
+    private fun nodesContainTarget(t: String): Boolean {
+        val root = rootInActiveWindow ?: return false
+        var found = false
+        walkNodes(root) { n ->
+            if (!found) {
+                val txt = ((n.text?.toString() ?: "") + (n.contentDescription?.toString() ?: ""))
+                    .lowercase().filter { it.isLetterOrDigit() }
+                if (txt.isNotEmpty() && fuzzyContains(txt, t)) found = true
+            }
+        }
+        return found
+    }
+
+    /** Cari tombol Ikuti / Mengikuti lewat pohon aksesibilitas, di area profil. Pair(tombolIkuti, tombolMengikuti). */
+    private fun findButtonNodes(topLimit: Int, bottomLimit: Int): Pair<Rect?, Rect?> {
+        val root = rootInActiveWindow ?: return Pair(null, null)
+        val follows = mutableListOf<Rect>()
+        val followings = mutableListOf<Rect>()
+        walkNodes(root) { n ->
+            val label = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim().lowercase()
+            if (label.isNotEmpty() && label.length <= 14) {
+                val r = Rect()
+                n.getBoundsInScreen(r)
+                if (!r.isEmpty && n.isVisibleToUser && r.centerY() >= topLimit && r.centerY() < bottomLimit) {
+                    if (label in FOLLOW_WORDS || label == "ikuti balik" || label == "follow back") {
+                        follows.add(r)
+                    } else if (label.startsWith("mengikuti") || label.startsWith("following") ||
+                        label == "diminta" || label == "requested"
+                    ) {
+                        followings.add(r)
+                    }
+                }
+            }
+        }
+        return Pair(follows.minByOrNull { it.top }, followings.minByOrNull { it.top })
     }
 
     /** Ambil @username target dari jendela tugas PR.SOCIAL. */
@@ -719,16 +867,26 @@ class AutomationService : AccessibilityService() {
                     return
                 }
                 // Baca angka di tab: tab berangka 0 = tidak ada misi, jangan dikunjungi (tidak "memaksa" cari)
+                val loadingNow = isLoadingOrError(lines)
                 for ((pl, c) in tabCounts(lines)) {
                     lastCount[pl] = c
                     val until = emptyUntil[pl]
                     if (c == 0) {
-                        if (until == null || now >= until) emptyUntil[pl] = now + emptyRetry(pl)
-                        emptyAtCount[pl] = 0
-                    } else if (until != null && c > (emptyAtCount[pl] ?: Int.MAX_VALUE) &&
-                        now >= until - emptyRetry(pl) + 60_000L
-                    ) {
-                        emptyUntil.remove(pl)   // ada misi baru muncul
+                        // angka 0 saat halaman masih memuat itu belum benar-benar "habis": tunggu stabil beberapa detik
+                        val z = (zeroTicks[pl] ?: 0) + 1
+                        zeroTicks[pl] = z
+                        if (z >= 4 && !loadingNow) {
+                            if (until == null || now >= until) emptyUntil[pl] = now + emptyRetry(pl)
+                            emptyAtCount[pl] = 0
+                        }
+                    } else {
+                        zeroTicks[pl] = 0
+                        val atCount = emptyAtCount[pl] ?: Int.MAX_VALUE
+                        if (until != null && c > atCount &&
+                            (atCount == 0 || now >= until - emptyRetry(pl) + 60_000L)
+                        ) {
+                            emptyUntil.remove(pl)   // ada misi baru muncul
+                        }
                     }
                 }
                 // 3. Pilih platform: TikTok dulu, lalu Instagram (yang tidak jeda / tidak habis)
@@ -736,6 +894,11 @@ class AutomationService : AccessibilityService() {
                 if (want == null) {
                     waitingAll = true
                     val wait = PRIORITY.minOf { maxOf(blockedUntil[it] ?: 0L, emptyUntil[it] ?: 0L) } - now
+                    if (now - lastRefreshAt >= WAIT_REFRESH_MS) {
+                        // jangan menunggu dengan daftar basi: refresh berkala supaya angka tab & misi terbaru terbaca
+                        doRefresh(now, "Cek ulang misi saat menunggu")
+                        return
+                    }
                     setStatus("TikTok & Instagram jeda/habis. Tunggu ${fmtDur(wait)}…")
                     return
                 }
@@ -842,6 +1005,17 @@ class AutomationService : AccessibilityService() {
             }
             .minByOrNull { it.rect.top }
         if (row == null) {
+            if (isLoadingOrError(lines)) {
+                // "Memuat tugas…" / "Tidak dapat memuat": BUKAN misi habis. Jangan tandai habis; refresh kalau kelamaan.
+                loadingTicks++
+                setStatus("Halaman tugas belum termuat ($loadingTicks)…")
+                if (loadingTicks >= 12) {
+                    loadingTicks = 0
+                    doRefresh(now, "Halaman tugas tidak termuat")
+                }
+                return
+            }
+            loadingTicks = 0
             idleTicks++
             setStatus("Tidak ada tugas Follow ${platform.label} terlihat (OCR ${lines.size} baris)")
             if (idleTicks >= 5) {
@@ -908,6 +1082,8 @@ class AutomationService : AccessibilityService() {
         tapY = -1
         linkWaitSince = 0L
         taskRefreshes = 0
+        acceptedProfileHdr = null
+        mismatchHdr = ""
     }
 
     private fun fmtDur(ms: Long): String {
@@ -929,6 +1105,9 @@ class AutomationService : AccessibilityService() {
         tabTaps = 0
         tabTapsFor = null
         idleTicks = 0
+        loadingTicks = 0
+        zeroTicks.clear()
+        waitingAll = false
         resumeTaps = 0
         stallSince = 0L
         lastRefreshAt = now
@@ -994,6 +1173,13 @@ class AutomationService : AccessibilityService() {
             ig > 0 && tk == 0 -> Platform.INSTAGRAM
             else -> null
         }
+    }
+
+    /** Halaman tugas sedang memuat atau menampilkan pesan gagal memuat. */
+    private fun isLoadingOrError(lines: List<OcrLine>): Boolean = lines.any {
+        val n = it.norm
+        n.contains("memuat") || n.contains("tidak dapat memuat") || n.contains("gagal memuat") ||
+            n.contains("terjadi kesalahan") || n.contains("tidak ada koneksi") || n.contains("coba lagi")
     }
 
     private fun emptyRetry(p: Platform): Long =
@@ -1278,11 +1464,13 @@ class AutomationService : AccessibilityService() {
         private const val BREAK_MAX_MS = 300_000L            // 5 menit
         private const val EXTRA_PAUSE_MIN_MS = 300_000L      // tambahan setelah jeda situs selesai: 5 menit
         private const val EXTRA_PAUSE_MAX_MS = 600_000L      // ... sampai 10 menit
+        private const val WAIT_REFRESH_MS = 60_000L         // saat semua platform jeda/habis: cek ulang tiap 1 menit
         private const val EMPTY_RETRY_IG_MS = 120_000L       // misi Instagram habis -> cek lagi 2 menit kemudian
         private const val EMPTY_RETRY_TIKTOK_MS = 300_000L   // misi TikTok habis -> cek lagi 5 menit kemudian
         private const val RESTRICT_BLOCK_MS = 1_800_000L     // TikTok membatasi aksi -> istirahat 30 menit
         private val TIKTOK_FRIEND_WORDS = setOf("teman", "friends")
         private const val MAX_PROFILE_TRIES = 5
+        private const val MISMATCH_ACCEPT_MS = 2_500L   // profil baru dari link: terima kalau stabil 2,5 detik
         private const val PROFILE_TIMEOUT = 25_000L
         private const val LINK_REFRESH_TIMEOUT = 28_000L   // link profil IG tidak jalan -> refresh web
         private const val STALL_REFRESH_TIMEOUT = 25_000L  // bot macet -> refresh web
