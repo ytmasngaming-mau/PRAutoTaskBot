@@ -10,8 +10,13 @@ import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.view.Display
 import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.LinearLayout
@@ -63,6 +68,8 @@ class AutomationService : AccessibilityService() {
 
     private var windowManager: WindowManager? = null
     private var overlay: LinearLayout? = null
+    private var overlayParams: WindowManager.LayoutParams? = null
+    private val uiHandler = Handler(Looper.getMainLooper())
     private var toggleView: TextView? = null
     private var statusView: TextView? = null
 
@@ -89,6 +96,11 @@ class AutomationService : AccessibilityService() {
     private val blockedUntil = mutableMapOf<Platform, Long>()   // jeda dari situs / pembatasan app
     private val emptyUntil = mutableMapOf<Platform, Long>()     // misi follow platform ini habis
     private var waitingAll = false
+    private var refreshAfterDone = false   // refresh web setiap satu misi selesai
+    private val lastCount = mutableMapOf<Platform, Int>()      // angka di tab platform (jumlah misi)
+    private val emptyAtCount = mutableMapOf<Platform, Int>()   // jumlah misi saat platform ditandai habis
+    private var sheetTries = 0
+    private val staleList = mutableSetOf<Platform>()   // platform yang daftarnya sudah basi karena jeda
     private var lastLikeCancelAt = 0L
     private var likeCancelTries = 0
     private var igDone = 0   // misi Instagram selesai (untuk jeda tiap 10 misi)
@@ -147,7 +159,6 @@ class AutomationService : AccessibilityService() {
             textSize = 15f
             setTextColor(Color.WHITE)
             setPadding(28, 18, 28, 18)
-            setOnClickListener { toggleEnabled() }
         }
         val status = TextView(this).apply {
             textSize = 11f
@@ -177,12 +188,71 @@ class AutomationService : AccessibilityService() {
             x = 12
             y = 120
         }
+        overlayParams = params
+        attachDrag(toggle, params) { toggleEnabled() }   // ketuk = ON/OFF, geser = pindahkan bubble
+        attachDrag(status, params, null)                 // teks status juga bisa dipakai menggeser
         try {
             windowManager?.addView(box, params)
         } catch (e: Exception) {
             Toast.makeText(this, "Gagal tampilkan tombol: ${e.message}", Toast.LENGTH_LONG).show()
         }
         refreshUi()
+    }
+
+    /** Bubble bisa digeser: tahan lalu seret. Ketukan singkat (tanpa geser) tetap ON/OFF. */
+    private fun attachDrag(v: View, params: WindowManager.LayoutParams, onTap: (() -> Unit)?) {
+        val slop = ViewConfiguration.get(this).scaledTouchSlop
+        var startX = 0
+        var startY = 0
+        var downX = 0f
+        var downY = 0f
+        var dragging = false
+        v.setOnTouchListener { _, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    startX = params.x
+                    startY = params.y
+                    downX = e.rawX
+                    downY = e.rawY
+                    dragging = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = e.rawX - downX
+                    val dy = e.rawY - downY
+                    if (!dragging && (abs(dx) > slop || abs(dy) > slop)) dragging = true
+                    if (dragging) {
+                        val dm = resources.displayMetrics
+                        val maxX = (dm.widthPixels - (overlay?.width ?: 300)).coerceAtLeast(0)
+                        val maxY = (dm.heightPixels - (overlay?.height ?: 200)).coerceAtLeast(0)
+                        // gravity END: x = jarak dari tepi kanan, jadi geser ke kanan = x mengecil
+                        params.x = (startX - dx).toInt().coerceIn(0, maxX)
+                        params.y = (startY + dy).toInt().coerceIn(0, maxY)
+                        try { windowManager?.updateViewLayout(overlay, params) } catch (_: Exception) {}
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!dragging) onTap?.invoke()
+                    true
+                }
+                else -> true
+            }
+        }
+    }
+
+    /** Saat bot perlu mengetuk tepat di bawah bubble, bubble dibuat "tembus sentuh" sebentar. */
+    private fun setOverlayTouchable(on: Boolean) {
+        uiHandler.post {
+            val p = overlayParams ?: return@post
+            val v = overlay ?: return@post
+            p.flags = if (on) {
+                p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+            } else {
+                p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            }
+            try { windowManager?.updateViewLayout(v, p) } catch (_: Exception) {}
+        }
     }
 
     private fun toggleEnabled() {
@@ -193,6 +263,10 @@ class AutomationService : AccessibilityService() {
             tabTaps = 0
             tabTapsFor = null
             blockedUntil.clear()
+            staleList.clear()
+            lastCount.clear()
+            emptyAtCount.clear()
+            refreshAfterDone = false
             emptyUntil.clear()
             waitingAll = false
             igDone = 0
@@ -274,7 +348,7 @@ class AutomationService : AccessibilityService() {
                 it.norm.contains("periksa follow saya") || it.norm.contains("buka profil dan ikuti") ||
                 it.norm.contains("tugas saya") || it.norm.contains("jeda untuk menjaga") ||
                 it.norm.contains("tugas sedang dikerjakan") || it.norm.contains("batalkan tugas") ||
-                it.norm.contains("buka postingan")
+                it.norm.contains("buka postingan") || it.norm.contains("pilih tempat bekerja")
         }
         if (looksPr) {
             if (pkg != null) browserPkg = pkg
@@ -374,6 +448,7 @@ class AutomationService : AccessibilityService() {
             } else {
                 // TikTok dibatasi: istirahatkan TikTok 30 menit, batalkan tugas, lanjut Instagram
                 if (now >= (blockedUntil[platform] ?: 0L)) blockedUntil[platform] = now + RESTRICT_BLOCK_MS
+                staleList.add(platform)
                 cancelAfterReturn = true
                 returnToBrowser(now, "TikTok membatasi aksi, istirahat ${RESTRICT_BLOCK_MS / 60_000} menit")
             }
@@ -568,6 +643,21 @@ class AutomationService : AccessibilityService() {
             return
         }
 
+        // Satu misi selesai -> pasti refresh web (tidak tergantung ada/tidaknya tombol "Tugas berikutnya")
+        if (refreshAfterDone) {
+            if (!canStartNew(now)) return
+            refreshAfterDone = false
+            doRefresh(now, "Tugas selesai")
+            return
+        }
+
+        // Sheet daftar platform terbuka (salah ketuk tab "+N"): pilih platform dari situ / tutup
+        if (lines.any { it.norm.contains("pilih tempat bekerja") }) {
+            handlePlatformSheet(lines, now)
+            return
+        }
+        sheetTries = 0
+
         // Misi like/suka/komentar (bukan follow) tidak dikerjakan: butuh screenshot, bot tidak bisa.
         // Kalau terbuka/terlanjur "sedang dikerjakan": batalkan, lalu refresh.
         if (check == null && isNonFollowModal(lines)) {
@@ -621,11 +711,25 @@ class AutomationService : AccessibilityService() {
                         Random.nextLong(EXTRA_PAUSE_MIN_MS, EXTRA_PAUSE_MAX_MS)
                     } else 0L
                     blockedUntil[pause.first] = now + pause.second + extra
+                    staleList.add(pause.first)
                     setStatus(
                         "Jeda situs ${pause.first.label}: ${fmtDur(pause.second)}" +
                             if (extra > 0) " + ${fmtDur(extra)} tambahan" else ""
                     )
                     return
+                }
+                // Baca angka di tab: tab berangka 0 = tidak ada misi, jangan dikunjungi (tidak "memaksa" cari)
+                for ((pl, c) in tabCounts(lines)) {
+                    lastCount[pl] = c
+                    val until = emptyUntil[pl]
+                    if (c == 0) {
+                        if (until == null || now >= until) emptyUntil[pl] = now + emptyRetry(pl)
+                        emptyAtCount[pl] = 0
+                    } else if (until != null && c > (emptyAtCount[pl] ?: Int.MAX_VALUE) &&
+                        now >= until - emptyRetry(pl) + 60_000L
+                    ) {
+                        emptyUntil.remove(pl)   // ada misi baru muncul
+                    }
                 }
                 // 3. Pilih platform: TikTok dulu, lalu Instagram (yang tidak jeda / tidak habis)
                 val want = choosePlatform(now)
@@ -637,7 +741,13 @@ class AutomationService : AccessibilityService() {
                 }
                 if (waitingAll) {
                     waitingAll = false
+                    staleList.remove(want)
                     doRefresh(now, "Jeda selesai")
+                    return
+                }
+                // Habis jeda: refresh dulu supaya daftar misi segar (misi siapa cepat dia dapat)
+                if (staleList.remove(want)) {
+                    doRefresh(now, "Jeda ${want.label} selesai")
                     return
                 }
                 // 4. Klik logo platform dulu (setelah refresh halaman kembali ke "Semua")
@@ -737,9 +847,8 @@ class AutomationService : AccessibilityService() {
             if (idleTicks >= 5) {
                 // Misi follow platform ini habis: refresh web, lalu pilih platform berikutnya
                 idleTicks = 0
-                emptyUntil[platform] = now + EMPTY_RETRY_MS
-                // platform lain langsung dicoba lagi (TikTok -> Instagram -> TikTok -> ...)
-                PRIORITY.filter { it != platform }.forEach { emptyUntil.remove(it) }
+                emptyUntil[platform] = now + emptyRetry(platform)
+                emptyAtCount[platform] = lastCount[platform] ?: Int.MAX_VALUE
                 doRefresh(now, "Misi follow ${platform.label} habis")
             }
             return
@@ -768,11 +877,13 @@ class AutomationService : AccessibilityService() {
         doneCount++
         val donePlatform = taskPlatform
         resetTask()
-        nextAllowedAt = now + Random.nextLong(2000, 4000)
+        refreshAfterDone = true
+        nextAllowedAt = now + Random.nextLong(3000, 5000)
         if (donePlatform == Platform.INSTAGRAM && ++igDone % TASKS_PER_BREAK == 0) {
             // Khusus Instagram: tiap 10 misi selesai, Instagram istirahat 3-5 menit (TikTok tidak ikut jeda)
             val ms = Random.nextLong(BREAK_MIN_MS, BREAK_MAX_MS)
             blockedUntil[Platform.INSTAGRAM] = now + ms
+            staleList.add(Platform.INSTAGRAM)
             setStatus("☕ $igDone misi Instagram selesai. Instagram istirahat ${fmtDur(ms)}…")
         } else {
             setStatus("✅ Tugas selesai. Jeda sebelum tugas berikutnya.")
@@ -859,6 +970,7 @@ class AutomationService : AccessibilityService() {
 
     /** Platform yang sedang ditampilkan di daftar tugas (dari judul daftar, cadangan: nama di baris tugas). */
     private fun shownPlatform(lines: List<OcrLine>, h: Int): Platform? {
+        if (lines.any { it.norm == "semua platform" }) return null   // tab "Semua" masih terpilih
         val tl = lines.firstOrNull {
             Regex("^\\d+ tugas").containsMatchIn(it.norm) && it.norm.contains("@")
         }
@@ -882,6 +994,40 @@ class AutomationService : AccessibilityService() {
             ig > 0 && tk == 0 -> Platform.INSTAGRAM
             else -> null
         }
+    }
+
+    private fun emptyRetry(p: Platform): Long =
+        if (p == Platform.TIKTOK) EMPTY_RETRY_TIKTOK_MS else EMPTY_RETRY_IG_MS
+
+    /** Angka jumlah misi di tab Instagram / TikTok (posisi tab dihitung dari geometri, sama seperti klik tab). */
+    private fun tabCounts(lines: List<OcrLine>): Map<Platform, Int> {
+        val semua = lines.filter { it.norm == "semua" }.minByOrNull { it.rect.top } ?: return emptyMap()
+        val w = resources.displayMetrics.widthPixels
+        val row = lines.filter {
+            abs(it.rect.centerY() - semua.rect.centerY()) < 45 && it.rect.centerX() > semua.rect.centerX()
+        }
+        val plus = row.filter { it.norm.startsWith("+") }.maxByOrNull { it.rect.centerX() } ?: return emptyMap()
+        val sc = w / 1080f
+        fun spacing(t: Int) = (w - 60f * sc - 12f * sc * (t - 1)) / t + 12f * sc
+        val span = (plus.rect.centerX() - semua.rect.centerX()).toFloat()
+        val tiles = (3..8).minByOrNull { abs(span - (it - 1) * spacing(it)) } ?: return emptyMap()
+        val d = spacing(tiles)
+        val out = mutableMapOf<Platform, Int>()
+        for ((idx, p) in listOf(Platform.INSTAGRAM, Platform.TIKTOK).withIndex()) {
+            if (idx + 1 >= tiles - 1) continue
+            val cx = semua.rect.centerX() + d * (idx + 1)
+            val item = row
+                .filter { !it.norm.startsWith("+") && abs(it.rect.centerX() - cx) < d / 2 - 12 }
+                .minByOrNull { abs(it.rect.centerX() - cx) } ?: continue
+            val n = item.norm
+            val v = when {
+                n == "o" || n == "0" -> 0
+                n.any { it.isDigit() } -> n.filter { it.isDigit() }.toIntOrNull()
+                else -> null
+            } ?: continue
+            out[p] = v
+        }
+        return out
     }
 
     /** Prioritas: TikTok dulu, lalu Instagram; lewati yang sedang jeda atau misinya habis. */
@@ -946,24 +1092,35 @@ class AutomationService : AccessibilityService() {
             return true
         }
         val w = resources.displayMetrics.widthPixels
-        val idx = if (want == Platform.INSTAGRAM) 0 else 1
-        val nums = lines.filter {
-            Regex("^\\+?\\d+$").matches(it.norm) &&
-                abs(it.rect.centerY() - semua.rect.centerY()) < 45 &&
-                it.rect.centerX() > semua.rect.centerX()
-        }.sortedBy { it.rect.centerX() }
-        val target: Rect = when {
-            nums.size > idx -> nums[idx].rect
-            semua.rect.centerY() < h * 0.27 -> Rect().apply {
-                val cx = (semua.rect.centerX() + w * (0.192f + 0.19f * idx)).toInt()
-                val cy = semua.rect.centerY() - 40
-                set(cx - 10, cy - 10, cx + 10, cy + 10)
+        val idx = if (want == Platform.INSTAGRAM) 0 else 1   // urutan tab: Semua, Instagram, TikTok, ..., +N
+        val rowItems = lines.filter {
+            abs(it.rect.centerY() - semua.rect.centerY()) < 45 && it.rect.centerX() > semua.rect.centerX()
+        }
+        val plus = rowItems.filter { it.norm.startsWith("+") }.maxByOrNull { it.rect.centerX() }
+        var target: Rect? = null
+        if (plus != null) {
+            // Lebar semua tab sama rata, jadi jarak "Semua" -> "+N" menunjukkan jumlah tab.
+            // Posisi tab dihitung dari situ (tidak bergantung pada angka yang terbaca OCR, mis. "0" atau ikon jam).
+            val sc = w / 1080f
+            fun spacing(t: Int) = (w - 60f * sc - 12f * sc * (t - 1)) / t + 12f * sc
+            val span = (plus.rect.centerX() - semua.rect.centerX()).toFloat()
+            val tiles = (3..8).minByOrNull { abs(span - (it - 1) * spacing(it)) } ?: 4
+            if (idx + 1 >= tiles - 1) {
+                tabTaps = 3
+                setStatus("Tab ${want.label} tidak ada")
+                return false
             }
-            else -> {
-                tabTaps++
-                setStatus("Tab ${want.label} tidak terlihat…")
-                return true
-            }
+            val cx = (semua.rect.centerX() + spacing(tiles) * (idx + 1)).toInt()
+            val cy = semua.rect.centerY()
+            target = Rect(cx - 10, cy - 10, cx + 10, cy + 10)
+        } else {
+            val items = rowItems.filter { !it.norm.startsWith("+") }.sortedBy { it.rect.centerX() }
+            if (items.size > idx) target = items[idx].rect
+        }
+        if (target == null) {
+            tabTaps++
+            setStatus("Tab ${want.label} tidak terlihat…")
+            return true
         }
         tap(target)
         tabTaps++
@@ -1041,6 +1198,27 @@ class AutomationService : AccessibilityService() {
         }
     }
 
+    /** Sheet "Platform - Pilih tempat bekerja" (terbuka kalau tab "+N" terketuk): pilih platform dari situ, atau tutup. */
+    private fun handlePlatformSheet(lines: List<OcrLine>, now: Long) {
+        if (now - lastTabTapAt < 1800) {
+            setStatus("Menunggu daftar platform menutup…")
+            return
+        }
+        lastTabTapAt = now
+        val want = choosePlatform(now) ?: Platform.INSTAGRAM
+        val h = resources.displayMetrics.heightPixels
+        val label = lines.firstOrNull { it.norm == want.label.lowercase() && it.rect.centerY() > h * 0.3 }
+        if (label != null && sheetTries < 3) {
+            sheetTries++
+            tap(label.rect)
+            setStatus("Memilih ${want.label} dari daftar platform…")
+        } else {
+            sheetTries = 0
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            setStatus("Menutup daftar platform…")
+        }
+    }
+
     /** Misi minta screenshot (biasanya muncul kalau klik profil >5x): cukup refresh web.
      *  Misinya akan muncul lagi di banner "Tugas sedang dikerjakan" dan dilanjutkan lewat Lanjutkan. */
     private fun handleScreenshotMission(now: Long) {
@@ -1077,6 +1255,15 @@ class AutomationService : AccessibilityService() {
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, 90))
             .build()
+        if (overlayRect().contains(r.centerX(), r.centerY())) {
+            // titik ketuk tertutup bubble: tembuskan sentuhan sebentar supaya tidak malah menekan bubble
+            setOverlayTouchable(false)
+            uiHandler.postDelayed({
+                dispatchGesture(gesture, null, null)
+                uiHandler.postDelayed({ setOverlayTouchable(true) }, 400)
+            }, 150)
+            return true
+        }
         return dispatchGesture(gesture, null, null)
     }
 
@@ -1091,7 +1278,8 @@ class AutomationService : AccessibilityService() {
         private const val BREAK_MAX_MS = 300_000L            // 5 menit
         private const val EXTRA_PAUSE_MIN_MS = 300_000L      // tambahan setelah jeda situs selesai: 5 menit
         private const val EXTRA_PAUSE_MAX_MS = 600_000L      // ... sampai 10 menit
-        private const val EMPTY_RETRY_MS = 120_000L          // misi habis -> coba lagi 2 menit kemudian
+        private const val EMPTY_RETRY_IG_MS = 120_000L       // misi Instagram habis -> cek lagi 2 menit kemudian
+        private const val EMPTY_RETRY_TIKTOK_MS = 300_000L   // misi TikTok habis -> cek lagi 5 menit kemudian
         private const val RESTRICT_BLOCK_MS = 1_800_000L     // TikTok membatasi aksi -> istirahat 30 menit
         private val TIKTOK_FRIEND_WORDS = setOf("teman", "friends")
         private const val MAX_PROFILE_TRIES = 5
