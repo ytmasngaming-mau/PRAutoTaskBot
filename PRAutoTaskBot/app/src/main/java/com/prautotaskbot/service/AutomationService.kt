@@ -89,6 +89,8 @@ class AutomationService : AccessibilityService() {
     private val blockedUntil = mutableMapOf<Platform, Long>()   // jeda dari situs / pembatasan app
     private val emptyUntil = mutableMapOf<Platform, Long>()     // misi follow platform ini habis
     private var waitingAll = false
+    private var lastLikeCancelAt = 0L
+    private var likeCancelTries = 0
     private var igDone = 0   // misi Instagram selesai (untuk jeda tiap 10 misi)
     private var shotSeenTicks = 0
     private var lastTabTapAt = 0L
@@ -271,7 +273,8 @@ class AutomationService : AccessibilityService() {
             it.norm.contains("ikuti di instagram") || it.norm.contains("ikuti di tiktok") ||
                 it.norm.contains("periksa follow saya") || it.norm.contains("buka profil dan ikuti") ||
                 it.norm.contains("tugas saya") || it.norm.contains("jeda untuk menjaga") ||
-                it.norm.contains("tugas sedang dikerjakan")
+                it.norm.contains("tugas sedang dikerjakan") || it.norm.contains("batalkan tugas") ||
+                it.norm.contains("buka postingan")
         }
         if (looksPr) {
             if (pkg != null) browserPkg = pkg
@@ -565,6 +568,14 @@ class AutomationService : AccessibilityService() {
             return
         }
 
+        // Misi like/suka/komentar (bukan follow) tidak dikerjakan: butuh screenshot, bot tidak bisa.
+        // Kalau terbuka/terlanjur "sedang dikerjakan": batalkan, lalu refresh.
+        if (check == null && isNonFollowModal(lines)) {
+            handleNonFollowTask(lines, now)
+            return
+        }
+        likeCancelTries = 0
+
         // Misi yang minta screenshot tidak bisa dikerjakan bot -> batalkan + refresh web
         // (modal "Mulai" memang memuat teks tangkapan layar, jadi diabaikan; harus bertahan 3 tick)
         if (check == null && startBtn == null && isScreenshotMission(lines, confirmMark)) {
@@ -588,18 +599,12 @@ class AutomationService : AccessibilityService() {
             return
         }
 
+        // Tombol "Tugas berikutnya" TIDAK dipakai: situs bisa memilihkan misi like/suka.
+        // Selesai satu tugas -> refresh web, lalu bot memilih sendiri misi follow dari daftar.
         val nextBtn = lines.firstOrNull { it.norm.contains("tugas berikutnya") }
         if (check == null && nextBtn != null) {
             if (!canStartNew(now)) return
-            if (choosePlatform(now) != taskPlatform) {
-                // platform ini jeda/habis atau ada platform berprioritas lebih tinggi -> refresh web
-                doRefresh(now, "Pindah platform")
-                return
-            }
-            tap(nextBtn.rect)
-            phase = Phase.LIST
-            phaseSince = now
-            setStatus("Lanjut ke tugas berikutnya…")
+            doRefresh(now, "Tugas selesai, kembali ke daftar")
             return
         }
 
@@ -721,7 +726,7 @@ class AutomationService : AccessibilityService() {
         val h = resources.displayMetrics.heightPixels
         val row = lines
             .filter {
-                it.norm.contains(platform.rowKey) &&
+                it.norm.contains(platform.rowKey) && !it.norm.contains("suka") &&
                     !it.norm.contains("dimulai") && !it.norm.contains("dikerjakan") &&
                     it.rect.centerY() > h * 0.18 && it.rect.centerY() < h * 0.85
             }
@@ -1004,6 +1009,35 @@ class AutomationService : AccessibilityService() {
             (n.contains("tangkapan layar") || n.contains("screenshot") || n.contains("unggah bukti") ||
                 n.contains("upload bukti") || n.contains("kirim bukti")) &&
                 !n.contains("tidak") && !n.contains("diperlukan") && !n.contains("not required")
+        }
+    }
+
+    private fun isNonFollowModal(lines: List<OcrLine>): Boolean {
+        if (lines.any { it.norm.contains("buka profil dan ikuti") }) return false
+        if (lines.any { it.norm.contains("buka postingan") }) return true
+        val modalHint = lines.any {
+            it.norm.contains("batalkan tugas") || it.norm.contains("tautan tidak berfungsi")
+        }
+        return modalHint && lines.any {
+            it.norm.startsWith("beri suka") || it.norm.startsWith("beri komentar") ||
+                it.norm.startsWith("komentar di") || it.norm.startsWith("bagikan di")
+        }
+    }
+
+    private fun handleNonFollowTask(lines: List<OcrLine>, now: Long) {
+        val cancel = lines.firstOrNull { it.norm.contains("batalkan tugas") }
+        if (cancel != null && likeCancelTries < 2) {
+            if (now - lastLikeCancelAt < 3000) {
+                setStatus("Menunggu pembatalan misi like/suka…")
+                return
+            }
+            tap(cancel.rect)
+            lastLikeCancelAt = now
+            likeCancelTries++
+            setStatus("Misi like/suka tidak dikerjakan, dibatalkan ($likeCancelTries/2)…")
+        } else {
+            likeCancelTries = 0
+            doRefresh(now, "Misi like/suka tidak dikerjakan")
         }
     }
 
