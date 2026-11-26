@@ -733,6 +733,8 @@ class AutomationService : AccessibilityService() {
                 // Misi follow platform ini habis: refresh web, lalu pilih platform berikutnya
                 idleTicks = 0
                 emptyUntil[platform] = now + EMPTY_RETRY_MS
+                // platform lain langsung dicoba lagi (TikTok -> Instagram -> TikTok -> ...)
+                PRIORITY.filter { it != platform }.forEach { emptyUntil.remove(it) }
                 doRefresh(now, "Misi follow ${platform.label} habis")
             }
             return
